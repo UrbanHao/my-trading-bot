@@ -11,6 +11,7 @@ try:
 except Exception:
     _ws_best_price = None
 from config import USE_TESTNET, ORDER_TIMEOUT_SEC
+from journal import log_trade # <-- 確保匯入 log_trade
 
 class SimAdapter:
     def __init__(self):
@@ -31,14 +32,16 @@ class SimAdapter:
         r.raise_for_status()
         return float(r.json()["price"])
     def place_bracket(self, symbol, side, qty, entry, sl, tp):
-        self.open = {"symbol":symbol, "side":side, "qty":qty, "entry":entry, "sl":sl, "tp":tp}
+        self.open = {"symbol":symbol, "side":side, "qty":float(qty), "entry":float(entry), "sl":float(sl), "tp":float(tp)}
         return "SIM-ORDER"
+    
+    # --- .csv Bug 修復 (A.1) ---
     def poll_and_close_if_hit(self, day_guard):
-        if not self.open: return False, None, None
+        if not self.open: return False, None, None, None, None # <--- 修改
         try:
             p = self.best_price(self.open["symbol"])
         except Exception as _e:
-            return False, None, None
+            return False, None, None, None, None # <--- 修改
         side = self.open["side"]
         hit_tp = (p >= self.open["tp"]) if side=="LONG" else (p <= self.open["tp"])
         hit_sl = (p <= self.open["sl"]) if side=="LONG" else (p >= self.open["sl"])
@@ -47,10 +50,28 @@ class SimAdapter:
             pct = (exit_price - self.open["entry"]) / self.open["entry"]
             if side == "SHORT": pct = -pct
             symbol = self.open["symbol"]
+            reason = "TP" if hit_tp else "SL"       # <--- 新增
+            trade_data = self.open                  # <--- 新增 (複製)
             self.open = None
             day_guard.on_trade_close(pct)
-            return True, pct, symbol
-        return False, None, None
+            
+            # --- ↓↓↓ 呼叫交易日誌 ↓↓↓ ---
+            try:
+                log_trade(
+                    symbol=symbol,
+                    side=trade_data["side"],
+                    qty=trade_data["qty"],
+                    entry=trade_data["entry"],
+                    exit_price=exit_price,
+                    ret_pct=pct,
+                    reason=reason
+                )
+            except Exception:
+                pass # (不在 adapter 中處理日誌錯誤)
+            # --- ↑↑↑ 結束呼叫 ↑↑↑ ---
+
+            return True, pct, symbol, reason, exit_price # <--- 修改
+        return False, None, None, None, None # <--- 修改
 
 class LiveAdapter:
     """
@@ -92,7 +113,7 @@ class LiveAdapter:
             # --- 新增除錯訊息 ---
             if not r.ok:
                 print(f"[API ERROR] POST {path} returned {r.status_code}")
-                print(f"Server msg: {r.text}")
+                # (我們不在這裡 print r.text，因為 main.py 會處理)
             # ------------------
 
             r.raise_for_status()
@@ -109,7 +130,7 @@ class LiveAdapter:
             # --- 新增除錯訊息 ---
             if not r.ok:
                 print(f"[API ERROR] {path} returned {r.status_code}")
-                print(f"Server msg: {r.text}")
+                # (我們不在這裡 print r.text，因為 main.py 會處理)
             # ------------------
             
             r.raise_for_status()
@@ -125,7 +146,7 @@ class LiveAdapter:
             # --- 新增除錯訊息 ---
             if not r.ok:
                 print(f"[API ERROR] DELETE {path} returned {r.status_code}")
-                print(f"Server msg: {r.text}")
+                # (我們不在這裡 print r.text，因為 main.py 會處理)
             # ------------------
 
             r.raise_for_status()
@@ -207,8 +228,9 @@ class LiveAdapter:
         }
         return str(entry_id)
 
+    # --- .csv Bug 修復 (A.2) ---
     def poll_and_close_if_hit(self, day_guard):
-        if not self.open: return False, None, None
+        if not self.open: return False, None, None, None, None # <--- 修改
         symbol = self.open["symbol"]
         side   = self.open["side"]
         entry  = float(self.open["entry"])
@@ -221,11 +243,13 @@ class LiveAdapter:
         sl_filled = sl_q.get("status") == "FILLED"
 
         if not tp_filled and not sl_filled:
-            return False, None, None
+            return False, None, None, None, None # <--- 修改
 
         exit_price = float(self.open["tp"] if tp_filled else self.open["sl"])
         pct = (exit_price - entry) / entry
         if side == "SHORT": pct = -pct
+        reason = "TP" if tp_filled else "SL" # <--- 新增
+        trade_data = self.open               # <--- 新增 (複製)
 
         # 撤另一條未成交單
         try:
@@ -238,4 +262,20 @@ class LiveAdapter:
 
         self.open = None
         day_guard.on_trade_close(pct)
-        return True, pct, symbol
+        
+        # --- ↓↓↓ 呼叫交易日誌 ↓↓↓ ---
+        try:
+            log_trade(
+                symbol=symbol,
+                side=trade_data["side"],
+                qty=trade_data["qty"],
+                entry=trade_data["entry"],
+                exit_price=exit_price,
+                ret_pct=pct,
+                reason=reason
+            )
+        except Exception:
+            pass # (不在 adapter 中處理日誌錯誤)
+        # --- ↑↑↑ 結束呼叫 ↑↑↑ ---
+            
+        return True, pct, symbol, reason, exit_price # <--- 修改

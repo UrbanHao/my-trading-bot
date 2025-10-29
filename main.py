@@ -115,16 +115,35 @@ def state_iter():
         # --- 結束 ---
 
         # 1) 平倉監控
+    # main.py (修改後)
         if adapter.has_open():
+            # (我們需要 trade_data 才能記錄，所以先複製)
+            trade_data_copy = adapter.open.copy() # <--- 新增
+
             try:
-                closed, pct, sym = adapter.poll_and_close_if_hit(day)
+                closed, pct, sym, reason, exit_price = adapter.poll_and_close_if_hit(day) # <--- 修改
             except Exception as e:
                 log(f"poll error: {e}")
-                closed, pct, sym = False, None, None
+                closed, pct, sym, reason, exit_price = False, None, None, None, None # <--- 修改
 
             if closed:
-                log(f"CLOSE {sym} pct={pct*100:.2f}% day={day.state.pnl_pct*100:.2f}%")
-                # 冷卻避免馬上下單、並讓下一輪立即抓 balance
+                log(f"CLOSE {sym} ({reason}) pct={pct*100:.2f}% day={day.state.pnl_pct*100:.2f}%") # <--- 修改
+
+                # --- ↓↓↓ 呼叫交易日誌 ↓↓↓ ---
+                try:
+                    log_trade(
+                        symbol=sym,
+                        side=trade_data_copy["side"],
+                        qty=trade_data_copy["qty"],
+                        entry=trade_data_copy["entry"],
+                        exit_price=exit_price,
+                        ret_pct=pct,
+                        reason=reason
+                    )
+                except Exception as e:
+                    log(f"Journal log_trade failed: {e}", "ERROR")
+                # --- ↑↑↑ 結束呼叫 ↑↑↑ ---
+
                 cooldown["until"] = time.time() + COOLDOWN_SEC
                 last_bal_ts = 0.0
 
