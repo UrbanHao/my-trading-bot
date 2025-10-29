@@ -1,0 +1,33 @@
+*** a/config.py
+--- b/config.py
+@@
+ BINANCE_FUTURES_BASE = "https://fapi.binance.com"  # USDT 永續
++
++# ===== 實盤連線與風控補充 =====
++# 建議先用 Futures 測試網驗證整套流程
++USE_TESTNET = True
++# 限價單等待成交的逾時秒數（逾時自動撤單）
++ORDER_TIMEOUT_SEC = 90
+*** a/adapters.py
+--- b/adapters.py
+@@
+-import os, hmac, hashlib, requests
+-from utils import now_ts_ms, SESSION, BINANCE_FUTURES_BASE
++import os, hmac, hashlib, requests, time
++from utils import now_ts_ms, SESSION, BINANCE_FUTURES_BASE
++from config import USE_TESTNET, ORDER_TIMEOUT_SEC
+@@
+-class LiveAdapter:
+-    """
+-    實盤：請把 place_bracket / poll_and_close_if_hit 換成你的 OCO/條件單流程。
+-    這裡只保留接口。
+-    """
++class LiveAdapter:
++    """
++    Binance USDT-M Futures — 限價進場 + 兩條互斥條件單（TP/SL，reduceOnly 全倉）
++    單向倉假設：一次只做一個方向的單。
++    流程：
++      1) LIMIT 進場（GTC），等待成交（逾時撤單）
++      2) 成交後同時掛 TAKE_PROFIT_MARKET 與 STOP_MARKET（closePosition=true）
++      3) 任一成交後撤另一單，回報當筆 PnL%
++    """

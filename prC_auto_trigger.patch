@@ -1,0 +1,190 @@
+*** a/config.py
+--- b/config.py
+@@
+-BINANCE_FUTURES_BASE = "https://fapi.binance.com"  # USDT 永續
++BINANCE_FUTURES_BASE = "https://fapi.binance.com"  # USDT 永續
++# 測試網 base（與正式網路徑分離，便於切換）
++BINANCE_FUTURES_TEST_BASE = "https://testnet.binancefuture.com"
++
++# === 連線與下單參數 ===
++# 先走測試網；驗證無誤再改 False
++USE_TESTNET = True
++# 限價單等待成交的逾時秒數（秒），逾時自撤單
++ORDER_TIMEOUT_SEC = 90
++
++# === 風控：日內停機 / 固定風險 ===
++# 日目標（達成→停機）
++TARGET_DAY_PCT = 0.015      # +1.5%
++# 日停損（達到→停機）
++MAX_DAY_DD = 0.02           # -2.0%
++# 單筆風險（Equity 的百分比，計算張數用）
++RISK_PER_TRADE = 0.0075     # 0.75% 風險
++# 盈虧比（TP% / SL%）
++TP_PCT = 0.015              # +1.5%
++SL_PCT = 0.0075             # -0.75%
++
++# === 訊號：vC（Volume Spike + Breakout） ===
++INTERVAL = "1m"             # 訊號用週期
++LOOKBACK_BARS = 30          # 突破前高的回看根數
++VOL_SPIKE_K = 2.0           # 量能放大倍數閾值（最後一根 vs 前 N 根均量）
++VOL_MA_BARS = 20            # 均量的計算根數
++OVEREXTEND_CAP = 0.02       # 當前漲幅不得超過此值才允許切入
++SCAN_INTERVAL_S = 12        # 每次掃描間隔秒數
++
++# === 交易額度（最小名目） ===
++# 若無法精確換算步進，先以 minQty 向上取整；或使用最小名目級距下單
++MIN_NOTIONAL_USDT = 10.0
+*** a/utils.py
+--- b/utils.py
+@@
+-import requests
++import requests
++from statistics import mean
+ from datetime import datetime, timezone
+-from config import USE_TESTNET
+-from config import BINANCE_FUTURES_BASE
++from config import (
++    USE_TESTNET, BINANCE_FUTURES_BASE, BINANCE_FUTURES_TEST_BASE,
++    INTERVAL, VOL_MA_BARS, LOOKBACK_BARS, VOL_SPIKE_K
++)
+ 
+ SESSION = requests.Session()
+ SESSION.headers.update({"User-Agent": "daily-gainer-vC/1.0"})
+ 
++def _base():
++    return BINANCE_FUTURES_TEST_BASE if USE_TESTNET else BINANCE_FUTURES_BASE
++
+ def now_ts_ms():
+     return int(datetime.now(timezone.utc).timestamp() * 1000)
+ 
+ def fetch_top_gainers(limit=10):
+-    url = f"{BINANCE_FUTURES_BASE}/fapi/v1/ticker/24hr"
++    url = f"{_base()}/fapi/v1/ticker/24hr"
+     r = SESSION.get(url, timeout=10)
+     r.raise_for_status()
+     data = r.json()
+     # 過濾 USDT 對
+     data = [d for d in data if d["symbol"].endswith("USDT")]
+@@
+     rows.sort(key=lambda x: x["change"], reverse=True)
+     return rows[:limit]
++
++def fetch_klines(symbol:str, interval:str=INTERVAL, limit:int=120):
++    url = f"{_base()}/fapi/v1/klines"
++    r = SESSION.get(url, params={"symbol":symbol, "interval":interval, "limit":limit}, timeout=10)
++    r.raise_for_status()
++    # kline: [openTime, open, high, low, close, volume, ...]
++    ks = r.json()
++    closes = [float(k[4]) for k in ks]
++    highs  = [float(k[2]) for k in ks]
++    vols   = [float(k[5]) for k in ks]
++    return closes, highs, vols
++
++def volume_spike(vols, ma_n=VOL_MA_BARS, k=VOL_SPIKE_K):
++    if len(vols) < ma_n + 1: return False
++    ma = mean(vols[-(ma_n+1):-1])  # 以前 N 根均量
++    return vols[-1] >= k * ma and vols[-1] > 0
++
++def breakout_ok(closes, highs, lookback=LOOKBACK_BARS):
++    if len(closes) < lookback + 1: return False
++    prev_high = max(highs[-(lookback+1):-1])
++    return closes[-1] > prev_high
++
++def fetch_symbol_filters(symbol:str):
++    """回傳 (price_tick, qty_step, min_qty, min_notional)"""
++    url = f"{_base()}/fapi/v1/exchangeInfo"
++    r = SESSION.get(url, params={"symbol":symbol}, timeout=10)
++    r.raise_for_status()
++    info = r.json()["symbols"][0]["filters"]
++    tick = step = min_qty = min_notional = None
++    for f in info:
++        if f["filterType"] == "PRICE_FILTER":
++            tick = float(f["tickSize"])
++        elif f["filterType"] == "LOT_SIZE":
++            step = float(f["stepSize"]); min_qty = float(f["minQty"])
++        elif f["filterType"] == "MIN_NOTIONAL":
++            min_notional = float(f.get("notional", 0))
++    return tick, step, min_qty, min_notional
++
++def round_to_step(x, step):
++    if step is None or step == 0: return x
++    return float(f"{(int(x/step)*step):.20f}".rstrip('0').rstrip('.'))
+*** a/main.py
+--- b/main.py
+@@
+ import os
+-from dotenv import load_dotenv
++from dotenv import load_dotenv
+ import time
+-from utils import fetch_top_gainers, SESSION
+-from adapters import SimAdapter, LiveAdapter
++from utils import fetch_top_gainers, SESSION, fetch_klines, volume_spike, breakout_ok, fetch_symbol_filters, round_to_step
++from adapters import SimAdapter, LiveAdapter
+ from panel import live_render
+-from config import USE_TESTNET
++from config import (
++    USE_TESTNET, TARGET_DAY_PCT, MAX_DAY_DD, RISK_PER_TRADE,
++    TP_PCT, SL_PCT, OVEREXTEND_CAP, SCAN_INTERVAL_S, MIN_NOTIONAL_USDT
++)
+ 
+ load_dotenv(override=True)
+ 
+ class DayGuard:
+@@
+         self.halted = False
+     def on_trade_close(self, pct):
+         self.day_pnl += pct
+         self.trades += 1
+         if self.day_pnl >= TARGET_DAY_PCT or self.day_pnl <= -MAX_DAY_DD:
+             self.halted = True
++    def can_trade(self): return not self.halted
+ 
+ def main():
+     use_live = os.getenv("USE_LIVE", "0") == "1"
+     adapter = LiveAdapter() if use_live else SimAdapter()
+     guard = DayGuard()
+@@
+-        # 1) 掃描 Top10
+-        top10 = fetch_top_gainers(10)
++        # 1) 掃描 Top10
++        top10 = fetch_top_gainers(10)
+         # 2) 面板刷新
+         live_render(top10, adapter, guard)
+ 
+-        # 3) TODO: 自動下單條件
+-        #    這裡加入 Volume Spike + Breakout 條件；單線程，只做一筆
++        # 3) 自動下單：Volume Spike + Breakout（只要沒有持倉、且當天未停機）
++        if guard.can_trade() and not adapter.has_open():
++            for row in top10:
++                sym = row["symbol"]
++                # 過濾 24h 漲幅已經過度延伸的
++                if row["change"] >= OVEREXTEND_CAP*100:  # row["change"]是百分比
++                    continue
++                closes, highs, vols = fetch_klines(sym)
++                if not (volume_spike(vols) and breakout_ok(closes, highs)):
++                    continue
++                # 成交價 / 風險計算
++                entry = adapter.best_price(sym)
++                sl    = entry * (1 - SL_PCT)
++                tp    = entry * (1 + TP_PCT)
++                # 估算可下最小張數（用步進 / 名目限制校正）
++                _, step, min_qty, min_notional = fetch_symbol_filters(sym)
++                # 以單筆風險（RISK_PER_TRADE）換算名目金額；保底 MIN_NOTIONAL_USDT
++                # 風險名目 ≈ entry * qty * SL_PCT  → qty ≈ (risk_usdt)/(entry*SL_PCT)
++                equity_usdt = float(os.getenv("EQUITY_USDT", "1000"))
++                risk_usdt   = max(MIN_NOTIONAL_USDT, equity_usdt * RISK_PER_TRADE)
++                raw_qty     = risk_usdt / (entry * SL_PCT)
++                qty         = max(min_qty or 0.0, round_to_step(raw_qty, step))
++                try:
++                    oid = adapter.place_bracket(sym, "LONG", qty, entry, sl, tp)
++                    EVENT = f"entry {sym} qty={qty} @ {entry:.6g} tp={tp:.6g} sl={sl:.6g}"
++                    print(EVENT)
++                    break  # 單線程：找到第一個合格標的就下單後停止掃描
++                except Exception as e:
++                    print(f"[order_fail] {sym}: {e}")
+ 
+-        time.sleep(10)
++        time.sleep(SCAN_INTERVAL_S)
+ 
+ if __name__ == "__main__":
+     main()
