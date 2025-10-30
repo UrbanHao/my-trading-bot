@@ -322,6 +322,7 @@ class LiveAdapter:
         return "OK"
 
 
+
     # ---------- 偵測是否已平倉 + 清殘單 + 記帳 ----------
     def poll_and_close_if_hit(self, day_guard):
         if not self.open:
@@ -384,15 +385,17 @@ class LiveAdapter:
         except Exception:
             pass
         return True, pct, symbol, reason, exit_price
+
     def _cancel_all_symbol_orders(self, symbol: str):
         """
         取消該標的所有未成交掛單（包含止盈止損）
-        避免越掛越多 closePosition 單。
+        避免每輪補單造成越掛越多。
         """
         try:
             r = self._delete("/fapi/v1/allOpenOrders", {"symbol": symbol})
-            log(f"🧹 已清空 {symbol} 所有掛單", "SYS")
+            log.info(f"[CANCEL] cleared all open orders for {symbol}")
             return r
         except Exception as e:
-            log(f"⚠️ 取消掛單失敗 {symbol}: {e}", "ERROR")
+            # 沒單 / 或 API 回覆 4xx 都當無事發生，避免阻斷流程
+            log.error(f"[CANCEL] failed to clear open orders for {symbol}: {e}")
             return None
