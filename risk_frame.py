@@ -110,3 +110,53 @@ def compute_stop_limit(price,
         limit_px = p * (1.0 - limit_off)
 
     return float(stop_px), float(limit_px)
+
+# --- BEGIN: compat wrapper for compute_stop_limit (accepts side or is_bull) ---
+def compute_stop_limit_compat(price,
+                              side: str = None,
+                              is_bull: bool = None,
+                              stop_offset_pct: float = None,
+                              limit_offset_pct: float = None,
+                              **_):
+    """
+    兼容版本：
+    - 可用 side="LONG"/"SHORT" 或 is_bull=True/False 表示方向（二者擇一）
+    - 可傳 stop_offset_pct / limit_offset_pct；未提供則用 config 預設
+    - **_ 會吞掉多餘的 keyword，避免舊/新呼叫不一致時拋錯
+    回傳: (stop_px, limit_px)
+    """
+    try:
+        p = float(price)
+    except Exception:
+        raise ValueError(f"compute_stop_limit: invalid price {price!r}")
+
+    if is_bull is None and side is None:
+        raise TypeError("compute_stop_limit requires 'side' or 'is_bull'")
+    if is_bull is None and side is not None:
+        is_bull = str(side).upper() == "LONG"
+    if side is None and is_bull is not None:
+        side = "LONG" if is_bull else "SHORT"
+
+    # 預設偏移（如 config 無此鍵，給安全缺省）
+    try:
+        import config
+        default_stop  = float(getattr(config, "ENTRY_STOP_OFFSET_PCT",  0.0005))  # 5 bps
+        default_limit = float(getattr(config, "ENTRY_LIMIT_OFFSET_PCT", 0.0010))  # 10 bps
+    except Exception:
+        default_stop, default_limit = 0.0005, 0.0010
+
+    stop_off  = float(stop_offset_pct)  if stop_offset_pct  is not None else default_stop
+    limit_off = float(limit_offset_pct) if limit_offset_pct is not None else default_limit
+
+    if is_bull:
+        stop_px  = p * (1.0 + stop_off)
+        limit_px = p * (1.0 + limit_off)
+    else:
+        stop_px  = p * (1.0 - stop_off)
+        limit_px = p * (1.0 - limit_off)
+
+    return float(stop_px), float(limit_px)
+
+# 將公開名稱繫結到相容版本，確保所有 import 都用到這個簽名
+compute_stop_limit = compute_stop_limit_compat
+# --- END: compat wrapper ---
