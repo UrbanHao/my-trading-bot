@@ -326,14 +326,39 @@ def state_iter():
                             tp_s    = f"{tp_f:.{price_prec}f}"
 
                             try:
-                                cooldown["symbol_lock"][symbol] = time.time() + 10  # 先鎖 10 秒，避免爆衝
+                                # === 🧱 新增：入場前防呆檢查，避免立即觸發 (-2021) ===
                                 try:
+                                    mp = adapter._get("/fapi/v1/premiumIndex", {"symbol": symbol})
+                                    mark_price = float(mp["markPrice"])
+                                except Exception:
+                                    r = SESSION.get(f"{adapter.base}/fapi/v1/ticker/price",
+                                                    params={"symbol": symbol}, timeout=5)
+                                    r.raise_for_status()
+                                    mark_price = float(r.json()["price"])
+
+                                will_immediately_trigger = (
+                                    (side.upper() == "LONG" and entry_f <= mark_price)
+                                    or (side.upper() == "SHORT" and entry_f >= mark_price)
+                                )
+                                if will_immediately_trigger:
+                                    log(f"Skip {symbol}: entry would immediately trigger (entry={entry_f}, mark={mark_price})", "SCAN")
+                                    cooldown["symbol_lock"][symbol] = time.time() + 60
+                                    candidate = None
+                                    continue  # <== 跳過這筆下單
+
+                                # === 原本的下單邏輯從這裡繼續 ===
+                                cooldown["symbol_lock"][symbol] = time.time() + 10  # 先鎖10秒，避免爆衝
+                                try:
+                                    # 若 adapter 有內建清掛單功能，先清掉舊掛單
                                     if hasattr(adapter, "cancel_open_orders"):
                                         adapter.cancel_open_orders(symbol)
                                 except Exception:
                                     pass
+
                                 adapter.place_bracket(symbol, side, qty_s, entry_s, sl_s, tp_s)
-                                position_view = {"symbol": symbol, "side": side, "qty": qty_f, "entry": entry_f, "sl": sl_f, "tp": tp_f}
+                                position_view = {"symbol": symbol, "side": side,
+                                                 "qty": qty_f, "entry": entry_f,
+                                                 "sl": sl_f, "tp": tp_f}
                                 log(f"OPEN {symbol} qty={qty_f} entry={entry_f:.6f} | {reason}", "ORDER")
 
                                 # 冷卻與重入鎖
@@ -344,13 +369,19 @@ def state_iter():
                             except requests.exceptions.HTTPError as e:
                                 try:
                                     server_msg = e.response.json()
+                                    code = server_msg.get("code")
+                                    msg = server_msg.get("msg")
                                     log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
-                                    log(f"SERVER MSG: {server_msg.get('msg')} (Code: {server_msg.get('code')})", "ERROR")
+                                    log(f"SERVER MSG: {msg} (Code: {code})", "ERROR")
+                                    # 🧱 若為 -2021，鎖 180 秒，避免重複下錯單
+                                    if code == -2021:
+                                        cooldown["symbol_lock"][symbol] = time.time() + 180
                                 except Exception:
                                     log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
                                     log(f"SERVER MSG: {e.response.text}", "ERROR")
                             except Exception as e:
                                 log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
+
 
         # 3) 更新顯示用 Equity
         account["equity"] = equity

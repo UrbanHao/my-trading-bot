@@ -204,68 +204,139 @@ class LiveAdapter:
                     return float(p)
             except Exception:
                 pass
-        r = SESSION.get(f"{BINANCE_FUTURES_BASE}/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=5)
+        r = SESSION.get(f"{self.base}/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=5)
         r.raise_for_status()
         return float(r.json()["price"])
 
     def place_bracket(self, symbol: str, side: str, qty_s: str, entry_s: str, sl_s: str, tp_s: str):
+        """
+        現價突破入場：
+        - 進場用 STOP_MARKET（只送 stopPrice）
+        - SL 用 STOP_MARKET(closePosition=true)
+        - TP 用 TAKE_PROFIT_MARKET(closePosition=true)
+        - 下單前先『清空該 symbol 的所有未成交委託』，避免 SL/TP 越堆越多
+        - workingType 改用 MARK_PRICE，比 CONTRACT_PRICE 更穩
+        - 嚴格檢查 stopPrice 與 MarkPrice 的相對位置，避免 -2021
+        """
         symbol = symbol.upper().strip()
         if symbol not in EXCHANGE_INFO:
             raise ValueError(f"symbol not tradable or not found in exchangeInfo: {symbol}")
 
+        # 先取消該 symbol 既有的未成交單（把殘留的 SL/TP 清掉）
+        self._cancel_all_symbol_orders(symbol)
+
         side_u = side.upper()
         is_bull = (side_u == "LONG")
 
-        # 1) 轉 float
         qty_f   = float(qty_s)
         entry_f = float(entry_s)
         sl_f    = float(sl_s)
         tp_f    = float(tp_s)
 
-        # 2) 先做最終對齊（你既有 _final_align 保留）
-        entry_f, qty_f, price_prec, qty_prec = _final_align(symbol, entry_f, qty_f)
-        sl_f,    _,     _,          _        = _final_align(symbol, sl_f,    qty_f)
-        tp_f,    _,     _,          _        = _final_align(symbol, tp_f,    qty_f)
+        # 讀取精度/最小跳動
+        info = EXCHANGE_INFO[symbol]
+        price_prec = int(info.get("pricePrecision", 8))
+        qty_prec   = int(info.get("quantityPrecision", 0))
+        tick_size  = float(info.get("tickSize", 0.0) or 0.0)
 
-        # 3) **重點**：進場觸發價(trigger)，用 entry_f +/− STOP_BUFFER_PCT（不是 compute_stop_limit 值）
-        STOP_BUFFER = float(getattr(config, "STOP_BUFFER_PCT", 0.001))  # 例如 0.1% 緩衝
+        # 取 Mark Price（避免 CONTRACT / Last 價造成 -2021）
+        try:
+            mp = self._get("/fapi/v1/premiumIndex", {"symbol": symbol})
+            mark_price = float(mp["markPrice"])
+        except Exception:
+            # 後備：取 ticker/price 當近似
+            r = SESSION.get(f"{self.base}/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=5)
+            r.raise_for_status()
+            mark_price = float(r.json()["price"])
+
+        # 進場 stopPrice 必須在「突破方向的外側」再推一格 tick，避免『立即觸發』
+        # BUY：stopPrice > mark_price
+        # SELL：stopPrice < mark_price
         if is_bull:
-            trigger_f = entry_f * (1.0 + STOP_BUFFER)
+            if entry_f <= mark_price:
+                entry_f = mark_price + (tick_size or 1e-8)
         else:
-            trigger_f = entry_f * (1.0 - STOP_BUFFER)
+            if entry_f >= mark_price:
+                entry_f = max(mark_price - (tick_size or 1e-8), 0.0)
 
+        # 同步把 SL/TP 對齊交易所格子
+        from decimal import Decimal, ROUND_DOWN
+        def _floor_to_step(val: float, step: float, prec: int) -> float:
+            if step and step > 0:
+                q = Decimal(str(step))
+                v = (Decimal(str(val)) / q).to_integral_value(rounding=ROUND_DOWN) * q
+            else:
+                v = Decimal(str(val))
+            return float(f"{v:.{prec}f}")
+
+        entry_f = _floor_to_step(entry_f, tick_size, price_prec)
+        sl_f    = _floor_to_step(sl_f,    tick_size, price_prec)
+        tp_f    = _floor_to_step(tp_f,    tick_size, price_prec)
+
+        qty_f   = float(f"{qty_f:.{qty_prec}f}")
         entry_s = f"{entry_f:.{price_prec}f}"
-        trigger_s  = f"{trigger_f:.{price_prec}f}"
         sl_s    = f"{sl_f:.{price_prec}f}"
         tp_s    = f"{tp_f:.{price_prec}f}"
         qty_s   = f"{qty_f:.{qty_prec}f}"
 
-        # 4) 下單前先清理舊委託（避免越掛越多）
-        try:
-            self.cancel_open_orders(symbol)
-        except Exception:
-            pass  # 沒有就算了
+        # --- 最後一次檢查：避免入場單會立刻觸發 ---
+        if is_bull and not (float(entry_s) > mark_price):
+            raise ValueError(f"BUY entry stopPrice({entry_s}) must be > markPrice({mark_price}) to avoid -2021")
+        if (not is_bull) and not (float(entry_s) < mark_price):
+            raise ValueError(f"SELL entry stopPrice({entry_s}) must be < markPrice({mark_price}) to avoid -2021")
 
-        # 5) 只送「進場 STOP_MARKET」
-        params_entry = {
+        # === 組參數 ===
+        base_params = {
             "symbol": symbol,
-            "side":   ("BUY" if is_bull else "SELL"),
-            "type":   "STOP_MARKET",
-            "stopPrice": trigger_s,            # ← 用 trigger，不是 SL、不是 TP
+            "workingType": "MARK_PRICE",     # 改用 Mark Price
+            "newOrderRespType": "RESULT",
+        }
+
+        # 進場（STOP_MARKET，只送 stopPrice）
+        params_entry = dict(base_params)
+        params_entry.update({
+            "side": ("BUY" if is_bull else "SELL"),
+            "type": "STOP_MARKET",
+            "stopPrice": entry_s,
             "quantity": qty_s,
             "timeInForce": "GTC",
-            "workingType": "CONTRACT_PRICE",
+            "priceProtect": "true",
             "newClientOrderId": f"entry_{int(time.time()*1000)}",
-        }
-        self._post("/fapi/v1/order", params_entry)
+        })
 
-        # 6) 設 pending 狀態，等成交再補 SL/TP
+        # 止損（closePosition=true）
+        params_sl = dict(base_params)
+        params_sl.update({
+            "side": ("SELL" if is_bull else "BUY"),
+            "type": "STOP_MARKET",
+            "stopPrice": sl_s,
+            "closePosition": "true",
+            "priceProtect": "true",
+            "newClientOrderId": f"sl_{int(time.time()*1000)}",
+        })
+
+        # 止盈（closePosition=true）
+        params_tp = dict(base_params)
+        params_tp.update({
+            "side": ("SELL" if is_bull else "BUY"),
+            "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": tp_s,
+            "closePosition": "true",
+            "priceProtect": "true",
+            "newClientOrderId": f"tp_{int(time.time()*1000)}",
+        })
+
+        # === 送單 ===
+        self._post("/fapi/v1/order", params_entry)
+        self._post("/fapi/v1/order", params_sl)
+        self._post("/fapi/v1/order", params_tp)
+
         self.open = {
             "symbol": symbol, "side": side_u, "qty": qty_f,
-            "entry": entry_f, "sl": float(sl_s), "tp": float(tp_s),
-            "pending": True   # 進場尚未成交
+            "entry": entry_f, "sl": float(sl_s), "tp": float(tp_s)
         }
-        return "PENDING_ENTRY"
+        return "OK"
+
 
 
     def poll_and_close_if_hit(self, day_guard):
@@ -357,3 +428,13 @@ class LiveAdapter:
 
         self.open["pending"] = False  # 已補齊 SL/TP
 
+    def _cancel_all_symbol_orders(self, symbol: str):
+        """
+        先把該標的所有『尚未成交』的委託（包含先前殘留的 SL/TP）全部取消。
+        避免每輪掃描又多丟一組 closePosition 單，越堆越多。
+        """
+        try:
+            self._delete("/fapi/v1/allOpenOrders", {"symbol": symbol})
+        except Exception:
+            # 沒單/或 API 回覆 400, 就當無事發生
+            pass
