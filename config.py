@@ -7,8 +7,6 @@ SYMBOL_BLACKLIST = [
 DAILY_TARGET_PCT = 0.30     # 當日達標 +1.5%
 DAILY_LOSS_CAP   = -0.15     # 當日最大虧損 -2%
 PER_TRADE_RISK   = 0.030    # 每筆風險 0.75% 權益
-TP_PCT           = 0.014     # 單筆停利 +1.5%
-SL_PCT           = 0.007    # 單筆止損 -0.75%
 MAX_TRADES_DAY   = 50         # 每日最多交易筆數
 SCAN_INTERVAL_S  = 5        # Top10 刷新頻率（秒）
 USE_LIVE         = True     # 先跑模擬；接實盤請改 True
@@ -67,7 +65,7 @@ BASE_MIN_BARS      = 12     # 窄幅箱體至少 10~20 根
 BASE_MAX_ATR_Q     = 0.35   # 箱體寬度 ≤ ATR 的 35% 分位（可依幣種微調）
 
 # 7) Stop-Limit 下單 buffer（實盤用；模擬同邏輯估成交）
-STOP_BUFFER_PCT    = 0.0005 # 0.05%
+STOP_BUFFER_PCT    = 0.001 # 0.05%
 LIMIT_BUFFER_PCT   = 0.0007 # 0.07%
 
 # ===== SCALP PRESET (新增) =====
@@ -79,8 +77,8 @@ SCALP_TIMEFRAME = "1m"
 SCAN_INTERVAL_S = 1.0        # 提高掃描頻率（原值保留，此值會在 Scalp 路由使用）
 
 # 風控與出場（短線）
-TP_PCT = 0.0020              # 20 bps
-SL_PCT = 0.0012              # 12 bps
+TP_PCT = 0.0024              # 20 bps
+SL_PCT = 0.0010              # 12 bps
 TIME_STOP_BARS = 3           # 3 根 1m 未觸發即離場
 COOLDOWN_S = 60              # 同標的冷卻秒數
 PER_TRADE_RISK = 0.0025      # 單筆 0.25% 權益風險

@@ -145,6 +145,9 @@ class LiveAdapter:
         BINANCE_FUTURES_TEST_BASE = "https://testnet.binancefuture.com"
         self.base = (BINANCE_FUTURES_TEST_BASE if USE_TESTNET else BINANCE_FUTURES_BASE)
         self.open = None
+    def cancel_open_orders(self, symbol: str):
+        # 取消該 symbol 所有未成交委託，避免越掛越多
+        self._delete("/fapi/v1/allOpenOrders", {"symbol": symbol})
 
     def _sign(self, params: dict):
         # 用「實際會發送的 URL 編碼字串」做 HMAC，避免 -1022
@@ -206,10 +209,6 @@ class LiveAdapter:
         return float(r.json()["price"])
 
     def place_bracket(self, symbol: str, side: str, qty_s: str, entry_s: str, sl_s: str, tp_s: str):
-        """
-        簽名不變（qty_s, entry_s, sl_s, tp_s）。
-        進場：STOP_MARKET（只送 stopPrice）
-        """
         symbol = symbol.upper().strip()
         if symbol not in EXCHANGE_INFO:
             raise ValueError(f"symbol not tradable or not found in exchangeInfo: {symbol}")
@@ -217,87 +216,67 @@ class LiveAdapter:
         side_u = side.upper()
         is_bull = (side_u == "LONG")
 
+        # 1) 轉 float
         qty_f   = float(qty_s)
         entry_f = float(entry_s)
         sl_f    = float(sl_s)
         tp_f    = float(tp_s)
 
-        try:
-            stop_px_raw, _ = compute_stop_limit(entry_f, side=side_u)
-        except Exception:
-            stop_px_raw = entry_f
-
+        # 2) 先做最終對齊（你既有 _final_align 保留）
         entry_f, qty_f, price_prec, qty_prec = _final_align(symbol, entry_f, qty_f)
-        stop_f,  _,     _,          _        = _final_align(symbol, stop_px_raw, qty_f)
-        sl_f,    _,     _,          _        = _final_align(symbol, sl_f,        qty_f)
-        tp_f,    _,     _,          _        = _final_align(symbol, tp_f,        qty_f)
+        sl_f,    _,     _,          _        = _final_align(symbol, sl_f,    qty_f)
+        tp_f,    _,     _,          _        = _final_align(symbol, tp_f,    qty_f)
+
+        # 3) **重點**：進場觸發價(trigger)，用 entry_f +/− STOP_BUFFER_PCT（不是 compute_stop_limit 值）
+        STOP_BUFFER = float(getattr(config, "STOP_BUFFER_PCT", 0.001))  # 例如 0.1% 緩衝
+        if is_bull:
+            trigger_f = entry_f * (1.0 + STOP_BUFFER)
+        else:
+            trigger_f = entry_f * (1.0 - STOP_BUFFER)
 
         entry_s = f"{entry_f:.{price_prec}f}"
-        stop_s  = f"{stop_f:.{price_prec}f}"
+        trigger_s  = f"{trigger_f:.{price_prec}f}"
         sl_s    = f"{sl_f:.{price_prec}f}"
         tp_s    = f"{tp_f:.{price_prec}f}"
         qty_s   = f"{qty_f:.{qty_prec}f}"
-        # --- 安全檢查，避免 STOP_MARKET 立即觸發 (-2021) ---
-        current_price = self.best_price(symbol)
-        try:
-            cp = float(current_price)
-            sl_f = float(sl_s)
-        except Exception:
-            cp = 0.0
 
-        if is_bull and sl_f >= cp:
-            sl_f = round(cp * 0.998, price_prec)
-            sl_s = f"{sl_f:.{price_prec}f}"
-        elif (not is_bull) and sl_f <= cp:
-            sl_f = round(cp * 1.002, price_prec)
-            sl_s = f"{sl_f:.{price_prec}f}"
-        # 進場：STOP_MARKET（不送 price，避免 -1111）
+        # 4) 下單前先清理舊委託（避免越掛越多）
+        try:
+            self.cancel_open_orders(symbol)
+        except Exception:
+            pass  # 沒有就算了
+
+        # 5) 只送「進場 STOP_MARKET」
         params_entry = {
             "symbol": symbol,
             "side":   ("BUY" if is_bull else "SELL"),
             "type":   "STOP_MARKET",
-            "stopPrice": stop_s,
+            "stopPrice": trigger_s,            # ← 用 trigger，不是 SL、不是 TP
             "quantity": qty_s,
             "timeInForce": "GTC",
             "workingType": "CONTRACT_PRICE",
             "newClientOrderId": f"entry_{int(time.time()*1000)}",
         }
-
-        # 止損：STOP_MARKET
-        params_sl = {
-            "symbol": symbol,
-            "side":   ("SELL" if is_bull else "BUY"),
-            "type":   "STOP_MARKET",
-            "stopPrice": sl_s,
-            "closePosition": "true",
-            "workingType": "CONTRACT_PRICE",
-            "newClientOrderId": f"sl_{int(time.time()*1000)}",
-        }
-
-        # 止盈：TAKE_PROFIT_MARKET
-        params_tp = {
-            "symbol": symbol,
-            "side":   ("SELL" if is_bull else "BUY"),
-            "type":   "TAKE_PROFIT_MARKET",
-            "stopPrice": tp_s,
-            "closePosition": "true",
-            "workingType": "CONTRACT_PRICE",
-            "newClientOrderId": f"tp_{int(time.time()*1000)}",
-        }
-
         self._post("/fapi/v1/order", params_entry)
-        self._post("/fapi/v1/order", params_sl)
-        self._post("/fapi/v1/order", params_tp)
 
+        # 6) 設 pending 狀態，等成交再補 SL/TP
         self.open = {
             "symbol": symbol, "side": side_u, "qty": qty_f,
-            "entry": entry_f, "sl": float(sl_s), "tp": float(tp_s)
+            "entry": entry_f, "sl": float(sl_s), "tp": float(tp_s),
+            "pending": True   # 進場尚未成交
         }
-        return "OK"
+        return "PENDING_ENTRY"
+
 
     def poll_and_close_if_hit(self, day_guard):
         if not self.open:
             return False, None, None, None, None
+
+        # 先嘗試補掛（若剛成交）
+        try:
+            self._attach_brackets_if_needed()
+        except Exception:
+            pass
         symbol = self.open["symbol"]
         side   = self.open["side"]
         entry  = float(self.open["entry"])
@@ -327,3 +306,54 @@ class LiveAdapter:
         except Exception:
             pass
         return True, pct, symbol, reason, exit_price
+
+    def _position_size(self, symbol: str) -> float:
+        # 用 /fapi/v2/positionRisk 抓當前倉位數量
+        arr = self._get("/fapi/v2/positionRisk", {"symbol": symbol})
+        # 回傳的可能是 list; 找對 symbol
+        if isinstance(arr, list):
+            for it in arr:
+                if it.get("symbol") == symbol:
+                    sz = float(it.get("positionAmt") or "0")
+                    return sz
+        return 0.0
+
+    def _attach_brackets_if_needed(self):
+        """若 self.open.pending=True 但倉位已建立，補掛 SL/TP"""
+        if not self.open or not self.open.get("pending"):
+            return
+        symbol = self.open["symbol"]
+        side_u = self.open["side"]
+        is_bull = (side_u == "LONG")
+
+        pos_sz = self._position_size(symbol)
+        if abs(pos_sz) < 1e-12:
+            return  # 還沒成交
+
+        # 成交了 → 補掛 reduce-only 的 SL/TP（用 *_MARKET + closePosition=true）
+        sl_s = f"{float(self.open['sl']):.8f}"
+        tp_s = f"{float(self.open['tp']):.8f}"
+
+        params_sl = {
+            "symbol": symbol,
+            "side":   ("SELL" if is_bull else "BUY"),
+            "type":   "STOP_MARKET",
+            "stopPrice": sl_s,
+            "closePosition": "true",
+            "workingType": "CONTRACT_PRICE",
+            "newClientOrderId": f"sl_{int(time.time()*1000)}",
+        }
+        params_tp = {
+            "symbol": symbol,
+            "side":   ("SELL" if is_bull else "BUY"),
+            "type":   "TAKE_PROFIT_MARKET",
+            "stopPrice": tp_s,
+            "closePosition": "true",
+            "workingType": "CONTRACT_PRICE",
+            "newClientOrderId": f"tp_{int(time.time()*1000)}",
+        }
+        self._post("/fapi/v1/order", params_sl)
+        self._post("/fapi/v1/order", params_tp)
+
+        self.open["pending"] = False  # 已補齊 SL/TP
+

@@ -36,10 +36,17 @@ def position_size_notional(equity: float) -> float:
     return max(notional, 0.0)
 
 def compute_bracket(entry: float, side: str):
-    if side == "LONG":
-        return entry*(1-SL_PCT), entry*(1+TP_PCT)
+    """
+    回傳 (sl_price, tp_price)。只用 entry & 常數百分比，直觀好懂。
+    """
+    side_u = (side or "").upper()
+    if side_u == "LONG":
+        sl = entry * (1.0 - SL_PCT)
+        tp = entry * (1.0 + TP_PCT)
     else:
-        return entry*(1+SL_PCT), entry*(1-TP_PCT)
+        sl = entry * (1.0 + SL_PCT)
+        tp = entry * (1.0 - TP_PCT)
+    return sl, tp
 
 class PositionClock:
     """追蹤持倉存活時間（以 bar 計）"""

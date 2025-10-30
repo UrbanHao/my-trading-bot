@@ -326,6 +326,12 @@ def state_iter():
                             tp_s    = f"{tp_f:.{price_prec}f}"
 
                             try:
+                                cooldown["symbol_lock"][symbol] = time.time() + 10  # 先鎖 10 秒，避免爆衝
+                                try:
+                                    if hasattr(adapter, "cancel_open_orders"):
+                                        adapter.cancel_open_orders(symbol)
+                                except Exception:
+                                    pass
                                 adapter.place_bracket(symbol, side, qty_s, entry_s, sl_s, tp_s)
                                 position_view = {"symbol": symbol, "side": side, "qty": qty_f, "entry": entry_f, "sl": sl_f, "tp": tp_f}
                                 log(f"OPEN {symbol} qty={qty_f} entry={entry_f:.6f} | {reason}", "ORDER")
