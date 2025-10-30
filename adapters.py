@@ -13,6 +13,18 @@ except Exception:
 from config import USE_TESTNET, ORDER_TIMEOUT_SEC,STOP_BUFFER_PCT, LIMIT_BUFFER_PCT
 from utils  import compute_stop_limit, conform_to_filters
 from journal import log_trade # <-- 確保匯入 log_trade
+from risk_frame import compute_stop_limit as _compute_stop_limit
+def compute_stop_limit(price, **kwargs):
+    """
+    本地轉接器：兼容舊呼叫（is_bull=...）與新呼叫（side=...）
+    之後統一轉成 side 交給 risk_frame 的 compute_stop_limit。
+    """
+    side = kwargs.get('side')
+    is_bull = kwargs.get('is_bull')
+    if side is None and is_bull is not None:
+        side = "LONG" if is_bull else "SHORT"
+    # 這裡只傳 price + side，其他額外 keyword 直接忽略（避免不相容）
+    return _compute_stop_limit(price, side=side)
 
 
 class SimAdapter:
