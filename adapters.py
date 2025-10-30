@@ -13,8 +13,9 @@ except Exception:
 from config import USE_TESTNET, ORDER_TIMEOUT_SEC,STOP_BUFFER_PCT, LIMIT_BUFFER_PCT
 from utils import conform_to_filters
 from risk_frame import compute_stop_limit as rf_compute_stop_limit
+compute_stop_limit = rf_compute_stop_limit
+
 from journal import log_trade # <-- 確保匯入 log_trade
-from risk_frame import compute_stop_limit as rf_compute_stop_limit
 class SimAdapter:
     def __init__(self):
         self.open = None
@@ -62,7 +63,12 @@ class SimAdapter:
             # 若外部傳字串，仍嘗試轉 float；失敗就退回最佳價
             ref_price = float(self.best_price(symbol))
 
-        stop_px, limit_px = rf_compute_stop_limit(ref_price, side=("LONG" if is_bull else "SHORT"), stop_offset_pct=STOP_BUFFER_PCT, limit_offset_pct=LIMIT_BUFFER_PCT)
+        stop_px, limit_px = compute_stop_limit(
+            ref_price,
+            is_bull=is_bull,
+            stop_offset_pct=STOP_BUFFER_PCT,
+            limit_offset_pct=LIMIT_BUFFER_PCT
+        )
 
         # 2) 以 limit 價作為模擬成交價；TP/SL 沿用呼叫端傳入
         self.open = {
