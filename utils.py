@@ -353,3 +353,24 @@ def compute_stop_limit(entry_ref: float, bullish: bool, stop_buf: float, limit_b
         limit = stop      * (1 - limit_buf)
     return (stop, limit)
     
+def vwap_from_klines(k1m, lookback=20):
+    if not k1m:
+        return None
+    data = k1m[-lookback:]
+    num = sum((h+l+c)/3.0 * v for (o,h,l,c,v,ts) in data)
+    den = sum(v for (_,_,_,_,v,_) in data)
+    return num/den if den else None
+
+def zscore_price_vs_vwap(k1m, lookback=20):
+    if len(k1m) < lookback:
+        return None
+    closes = [c for (o,h,l,c,v,ts) in k1m[-lookback:]]
+    vwap = vwap_from_klines(k1m, lookback)
+    std = statistics.pstdev(closes)
+    last = closes[-1]
+    if vwap is None or std == 0:
+        return None
+    return (last - vwap) / std
+
+def last_close(k1m):
+    return k1m[-1][3] if k1m else None

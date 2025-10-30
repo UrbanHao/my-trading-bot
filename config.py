@@ -70,3 +70,31 @@ BASE_MAX_ATR_Q     = 0.35   # 箱體寬度 ≤ ATR 的 35% 分位（可依幣種
 STOP_BUFFER_PCT    = 0.0005 # 0.05%
 LIMIT_BUFFER_PCT   = 0.0007 # 0.07%
 
+# ===== SCALP PRESET (新增) =====
+SCALP_MODE = None            # None / "breakout" / "vwap"
+USE_RETEST = False           # Scalp 模式下關閉回測入場（原策略可設 True）
+
+# 時間框架與掃描
+SCALP_TIMEFRAME = "1m"
+SCAN_INTERVAL_S = 1.0        # 提高掃描頻率（原值保留，此值會在 Scalp 路由使用）
+
+# 風控與出場（短線）
+TP_PCT = 0.0020              # 20 bps
+SL_PCT = 0.0012              # 12 bps
+TIME_STOP_BARS = 3           # 3 根 1m 未觸發即離場
+COOLDOWN_S = 60              # 同標的冷卻秒數
+PER_TRADE_RISK = 0.0025      # 單筆 0.25% 權益風險
+DAILY_LOSS_CAP = -0.015      # 日停損 -1.5%
+DAILY_TARGET_PCT = 0.010     # 日停利 +1%
+
+# 輕量市場結構濾網
+VWAP_DIST_MAX = 0.004        # |price-vwap|/vwap ≤ 0.40%
+SPREAD_MAX_PCT = 0.0005      # 5 bps
+OBI_THRESHOLD = 0.60         # 頂層委買/賣佔比
+TRADE_IMB_LOOKBACK_S = 15    # 主動成交量觀察窗（秒）
+
+# 執行策略
+MAKER_ENTRY = True           # 先以 maker 進場
+TAKER_EXIT = True            # 允許以市價快速離場
+SLIPPAGE_CAP_PCT = 0.0007    # 市價/可成交限價最大滑點 7 bps
+MAX_OPEN_POSITIONS = 1       # 建議同時僅持 1 檔（降干擾）

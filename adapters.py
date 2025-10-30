@@ -5,14 +5,15 @@ try:
 except NameError:
     TIME_OFFSET_MS = 0  # fallback if not imported
 from dotenv import dotenv_values
-import os
+import os, config
 try:
     from ws_client import ws_best_price as _ws_best_price
 except Exception:
     _ws_best_price = None
 from config import USE_TESTNET, ORDER_TIMEOUT_SEC,STOP_BUFFER_PCT, LIMIT_BUFFER_PCT
-from utils  import compute_stop_limit
+from utils  import compute_stop_limit, conform_to_filters
 from journal import log_trade # <-- 確保匯入 log_trade
+
 
 class SimAdapter:
     def __init__(self):
@@ -32,6 +33,18 @@ class SimAdapter:
         r = SESSION.get(f"{base}/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=5)
         r.raise_for_status()
         return float(r.json()["price"])
+    def place_entry_smart(self, symbol, side, qty, ref_price, tick_size):
+        # 模擬：maker 嘗試立即成交；未成→直接以 ref_price±slippage 成交
+        from random import random
+        filled_px = ref_price
+        # 50% 機率 maker 秒成
+        if random() < 0.5:
+            return {"orderId": f"SIM_{time.time()}", "avgPrice": filled_px}
+        # taker with slippage cap
+        slip = ref_price * min(config.SLIPPAGE_CAP_PCT, 0.0005)
+        filled_px = ref_price + (slip if side == "LONG" else -slip)
+        return {"orderId": f"SIM_{time.time()}", "avgPrice": filled_px}
+        
     def place_bracket(self, symbol, side, qty, entry, sl, tp):
         """
         模擬端改為 Stop-Limit 模式：
@@ -197,7 +210,39 @@ class LiveAdapter:
         r = SESSION.get(f"{BINANCE_FUTURES_BASE}/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=5)
         r.raise_for_status()
         return float(r.json()["price"])
+    def place_entry_smart(self, symbol, side, qty, ref_price, tick_size):
+        """
+        maker 優先：以不穿價的限價下單；X 毫秒未成交則撤單→市價（限制最大滑點）
+        不影響既有 STOP-LIMIT 進場流程；只在 Scalp 模式使用。
+        """
+        # 1) maker 限價（若交易所支援 post-only，可帶 timeInForce='GTX'；否則將價格壓到不跨檔）
+        px = ref_price
+        # 讓買單價 <= bestBid、賣單價 >= bestAsk（外部請餵入）
+        order_id = self._place_limit(symbol, side, qty, px, post_only=True)
+        t0 = time.time()
+        filled = False
+        while time.time() - t0 < 1.5:  # 1.5 秒觀察窗
+            st = self._query_order(symbol, order_id)
+            if st["status"] in ("FILLED", "PARTIALLY_FILLED"):
+                filled = True
+                break
+            time.sleep(0.1)
 
+        if not filled:
+            self._cancel_order(symbol, order_id)
+            # 2) 市價 / 可成交限價（滑點上限）
+            last = self._get_last_price(symbol)  # 由 ws / ticker 提供
+            # 價格保護
+            allowed = ref_price * config.SLIPPAGE_CAP_PCT
+            if side == "LONG" and last > ref_price * (1 + config.SLIPPAGE_CAP_PCT):
+                raise RuntimeError("slippage too large on taker entry (long)")
+            if side == "SHORT" and last < ref_price * (1 - config.SLIPPAGE_CAP_PCT):
+                raise RuntimeError("slippage too large on taker entry (short)")
+            order_id = self._place_market(symbol, side, qty)
+
+        avg_entry = self._get_filled_price(symbol, order_id)
+        return {"orderId": order_id, "avgPrice": avg_entry}
+        
     # adapters.py (修改後的版本)
     def place_bracket(self, symbol, side, qty_str, entry_str, sl_str, tp_str):
         """
