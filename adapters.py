@@ -10,7 +10,8 @@ try:
     from ws_client import ws_best_price as _ws_best_price
 except Exception:
     _ws_best_price = None
-from config import USE_TESTNET, ORDER_TIMEOUT_SEC
+from config import USE_TESTNET, ORDER_TIMEOUT_SEC,STOP_BUFFER_PCT, LIMIT_BUFFER_PCT
+from utils  import compute_stop_limit
 from journal import log_trade # <-- 確保匯入 log_trade
 
 class SimAdapter:
@@ -32,7 +33,38 @@ class SimAdapter:
         r.raise_for_status()
         return float(r.json()["price"])
     def place_bracket(self, symbol, side, qty, entry, sl, tp):
-        self.open = {"symbol":symbol, "side":side, "qty":float(qty), "entry":float(entry), "sl":float(sl), "tp":float(tp)}
+        """
+        模擬端改為 Stop-Limit 模式：
+          - 用 entry 當「參考位」計算 stop/limit
+          - 以 limit 價當作模擬成交價（保守估計滑價）
+        簽名與回傳值不變。
+        """
+        # side: "LONG" / "SHORT"
+        is_bull = (side == "LONG")
+
+        # 1) 由 entry 作為參考位，計算 stop / limit
+        try:
+            ref_price = float(entry)
+        except Exception:
+            # 若外部傳字串，仍嘗試轉 float；失敗就退回最佳價
+            ref_price = float(self.best_price(symbol))
+
+        stop_px, limit_px = compute_stop_limit(ref_price, is_bull, STOP_BUFFER_PCT, LIMIT_BUFFER_PCT)
+
+        # 2) 以 limit 價作為模擬成交價；TP/SL 沿用呼叫端傳入
+        self.open = {
+            "symbol": symbol,
+            "side": side,
+            "qty": float(qty),
+            "entry": float(limit_px),      # <--- 用 limit 當模擬成交價
+            "sl": float(sl),
+            "tp": float(tp),
+            # 非必要，但可保留計算痕跡（方便除錯/觀察）
+            "entry_ref": float(ref_price),
+            "entry_stop": float(stop_px),
+            "entry_limit": float(limit_px),
+            "orderType": "SIM-STOP-LIMIT"
+        }
         return "SIM-ORDER"
     
     # --- .csv Bug 修復 (A.1) ---
@@ -168,47 +200,73 @@ class LiveAdapter:
 
     # adapters.py (修改後的版本)
     def place_bracket(self, symbol, side, qty_str, entry_str, sl_str, tp_str):
-        if side not in ("LONG","SHORT"):
+        """
+        Binance USDT-M Futures — 以 STOP-LIMIT 進場 + 兩條互斥條件單（TP/SL，closePosition=true）
+        流程：
+          1) STOP-LIMIT 進場（type="STOP"，stopPrice=觸發價，price=限價），等待成交（逾時撤單）
+          2) 成交後掛 TAKE_PROFIT_MARKET / STOP_MARKET（closePosition=true）
+        簽名與回傳值不變。
+        """
+        if side not in ("LONG", "SHORT"):
             raise ValueError("side must be LONG/SHORT")
-        order_side = "BUY" if side=="LONG" else "SELL"
+        order_side = "BUY" if side == "LONG" else "SELL"
 
-        # 1) 限價進場（GTC）
-        # (我們不再需要 try/except 精度，main.py 已經處理完畢)
+        # 1) 由 entry_str 作為「參考位」計算 stop / limit
+        try:
+            ref_price = float(entry_str)
+        except Exception:
+            # 保底：用 ticker 價當參考
+            ref_price = float(self.best_price(symbol))
+
+        stop_px, limit_px = compute_stop_limit(ref_price, is_bull=(side == "LONG"),
+                                               stop_buf=STOP_BUFFER_PCT, limit_buf=LIMIT_BUFFER_PCT)
+
+        # 2) 送出 STOP-LIMIT 進場單
+        #   Binance Futures 進場觸發單：type="STOP"（需同時提供 stopPrice 與 price）
+        #   timeInForce 一般用 GTC；workingType 可用 CONTRACT_PRICE
         entry_params = {
             "symbol": symbol,
             "side": order_side,
-            "type": "LIMIT",
+            "type": "STOP",            # <--- 關鍵：STOP-LIMIT（有 price + stopPrice）
             "timeInForce": "GTC",
-            "quantity": qty_str,   # <--- 直接使用 main.py 傳來的字串
-            "price": entry_str,    # <--- 直接使用 main.py 傳來的字串
+            "quantity": qty_str,
+            "price": f"{limit_px:.10f}",       # 限價
+            "stopPrice": f"{stop_px:.10f}",    # 觸發價
+            "workingType": "CONTRACT_PRICE",
             "newClientOrderId": f"entry_{int(time.time())}"
         }
         entry_res = self._post("/fapi/v1/order", entry_params)
         entry_id = entry_res["orderId"]
 
-        # 2) 等待成交或逾時撤單
+        # 3) 等待成交或逾時撤單
         t0 = time.time()
         filled = False
         while time.time() - t0 < ORDER_TIMEOUT_SEC:
-            q = self._get("/fapi/v1/order", {"symbol":symbol, "orderId":entry_id})
-            if q.get("status") == "FILLED":
+            q = self._get("/fapi/v1/order", {"symbol": symbol, "orderId": entry_id})
+            st = q.get("status")
+            if st == "FILLED":
                 filled = True
                 break
+            # 若已成為過期或被撤銷，也結束等待
+            if st in ("CANCELED", "EXPIRED", "REJECTED"):
+                break
             time.sleep(0.6)
+
         if not filled:
             try:
-                self._delete("/fapi/v1/order", {"symbol":symbol, "orderId":entry_id})
+                self._delete("/fapi/v1/order", {"symbol": symbol, "orderId": entry_id})
             finally:
                 self.open = None
-            raise TimeoutError("Entry limit order not filled within timeout; canceled.")
+            raise TimeoutError("Entry stop-limit order not filled within timeout; canceled.")
 
-        # 3) 成交後掛 TP/SL — closePosition(true) 等同 reduceOnly 全倉
-        exit_side = "SELL" if side=="LONG" else "BUY"
+        # 4) 成交後同時掛 TP / SL（closePosition=true）
+        exit_side = "SELL" if side == "LONG" else "BUY"
+
         tp_res = self._post("/fapi/v1/order", {
             "symbol": symbol,
             "side": exit_side,
             "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": tp_str,   # <--- 直接使用 main.py 傳來的字串
+            "stopPrice": tp_str,
             "closePosition": "true",
             "workingType": "CONTRACT_PRICE"
         })
@@ -216,15 +274,21 @@ class LiveAdapter:
             "symbol": symbol,
             "side": exit_side,
             "type": "STOP_MARKET",
-            "stopPrice": sl_str,   # <--- 直接使用 main.py 傳來的字串
+            "stopPrice": sl_str,
             "closePosition": "true",
             "workingType": "CONTRACT_PRICE"
         })
+
+        # 5) 記錄部位（以限價作為 entry 記錄；實際成交價可再用查單補寫）
         self.open = {
-            "symbol":symbol, "side":side, "qty":float(qty_str),
-            "entry":float(entry_str), "sl":float(sl_str), "tp":float(tp_str),
+            "symbol": symbol, "side": side, "qty": float(qty_str),
+            "entry": float(limit_px), "sl": float(sl_str), "tp": float(tp_str),
             "entryId": entry_id,
-            "tpId": tp_res["orderId"], "slId": sl_res["orderId"]
+            "tpId": tp_res["orderId"], "slId": sl_res["orderId"],
+            "entry_ref": float(ref_price),
+            "entry_stop": float(stop_px),
+            "entry_limit": float(limit_px),
+            "orderType": "STOP-LIMIT"
         }
         return str(entry_id)
 

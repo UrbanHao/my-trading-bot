@@ -265,3 +265,91 @@ def conform_to_filters(symbol: str, price: float, qty: float):
             qty = max(qty, need)
 
     return price, qty, int(info["pricePrecision"]), int(info["quantityPrecision"])
+
+# ===== Helpers for Breakout Pullback 強化 =====
+import math
+import statistics
+from typing import Sequence, Tuple
+
+def vwap(prices: Sequence[float], highs: Sequence[float], lows: Sequence[float], vols: Sequence[float]) -> float:
+    """簡易 session VWAP（以 close 近似典型價）"""
+    if not prices or not vols or sum(vols) == 0:
+        return prices[-1] if prices else float('nan')
+    pv = sum(p * v for p, v in zip(prices, vols))
+    vv = sum(vols)
+    return pv / vv
+
+def ema_slope(values: Sequence[float], n: int) -> float:
+    """回傳 EMA(n) 的近似斜率（最後兩點差）"""
+    if len(values) < n + 2:
+        return 0.0
+    k = 2 / (n + 1)
+    ema_vals = []
+    ema_now = values[-(n+1)]
+    for x in values[-n:]:
+        ema_now = k * x + (1 - k) * ema_now
+        ema_vals.append(ema_now)
+    if len(ema_vals) < 2:
+        return 0.0
+    return ema_vals[-1] - ema_vals[-2]
+
+def pct_dist(a: float, b: float) -> float:
+    """|a-b| / a"""
+    if a == 0:
+        return 0.0
+    return abs(a - b) / a
+
+def atr(series_high: Sequence[float], series_low: Sequence[float], series_close: Sequence[float], n: int = 14) -> float:
+    """簡易 ATR"""
+    trs = []
+    for i in range(1, len(series_close)):
+        tr = max(series_high[i]-series_low[i], abs(series_high[i]-series_close[i-1]), abs(series_low[i]-series_close[i-1]))
+        trs.append(tr)
+    if len(trs) < n:
+        return statistics.mean(trs) if trs else 0.0
+    return statistics.mean(trs[-n:])
+
+def box_base_ok(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float],
+                min_bars: int, atr_q: float) -> bool:
+    """檢查箱體基底是否足夠長且窄幅（以 ATR 的分位做門檻）"""
+    if len(closes) < min_bars + 2:
+        return False
+    sub_h = highs[-(min_bars+1):-1]
+    sub_l = lows [-(min_bars+1):-1]
+    sub_c = closes[-(min_bars+1):-1]
+    width = max(sub_h) - min(sub_l)
+    base_atr = atr(highs, lows, closes, n=14)
+    if base_atr == 0:
+        return False
+    # 以 ATR 比例視為窄幅
+    return (width / base_atr) <= (atr_q / 0.5)  # 粗略映射，足夠實用
+
+def fatigue_exhausted(closes: Sequence[float], m: int, min_streak: int, total_move: float, bullish: bool) -> bool:
+    """檢測最近 m 根是否有「連續上/下漲且總變動>門檻」"""
+    if len(closes) < m + 1:
+        return False
+    seg = closes[-(m+1):]
+    diffs = [seg[i] - seg[i-1] for i in range(1, len(seg))]
+    streak = 0
+    total = 0.0
+    for d in diffs:
+        if (d > 0 and bullish) or (d < 0 and not bullish):
+            streak += 1
+            total += abs(d) / seg[-2]  # 近似百分比
+        else:
+            streak = 0
+            total = 0.0
+        if streak >= min_streak and total >= total_move:
+            return True
+    return False
+
+def compute_stop_limit(entry_ref: float, bullish: bool, stop_buf: float, limit_buf: float) -> Tuple[float, float]:
+    """計算 stop 與 limit 價位（實盤/模擬共用）"""
+    if bullish:
+        stop  = entry_ref * (1 + stop_buf)
+        limit = stop      * (1 + limit_buf)
+    else:
+        stop  = entry_ref * (1 - stop_buf)
+        limit = stop      * (1 - limit_buf)
+    return (stop, limit)
+    
