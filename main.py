@@ -359,15 +359,16 @@ def state_iter():
                                     server_msg = e.response.json()
                                     code = server_msg.get("code")
                                     msg = server_msg.get("msg")
-                                    log.error(f"ORDER FAILED for {symbol}: {e}")
-                                    log.error(f"SERVER MSG: {msg} (Code: {code})")
+                                    log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
+                                    log(f"SERVER MSG: {msg} (Code: {code})", "ERROR")
                                     if code == -2021:
                                         cooldown["symbol_lock"][symbol] = time.time() + 180
                                 except Exception:
-                                    log.error(f"ORDER FAILED for {symbol}: {e}")
-                                    log.error(f"SERVER MSG: {e.response.text}")
+                                    log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
+                                    log(f"SERVER MSG: {e.response.text}", "ERROR")
                             except Exception as e:
-                                log.error(f"ORDER FAILED for {symbol}: {e}")
+                                log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
+
 
         # 3) 更新顯示用 Equity
         account["equity"] = equity
