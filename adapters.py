@@ -150,6 +150,8 @@ class LiveAdapter:
         self.base = (BINANCE_FUTURES_TEST_BASE if USE_TESTNET else BINANCE_FUTURES_BASE)
         # self.open: 紀錄目前部位&保護單 id，方便後續取消
         self.open = None
+        self.default_leverage = 10  # ✅ 新增這行
+
 
     # ---------- 低階 API ----------
     def _sign(self, params: dict):
@@ -289,10 +291,11 @@ class LiveAdapter:
         balance = self.balance_usdt()
 
         # 檢查是否有足夠保證金（此為大略估算）
-        notional = qty_f * mark_price / float(LEVERAGE or 10)
+        leverage = getattr(self, "default_leverage", 10)
+        notional = qty_f * mark_price / leverage
         if notional > balance * 0.95:
-            # 調整數量讓可開倉不報 -2019
-            qty_f = (balance * 0.9 * float(LEVERAGE or 10)) / mark_price
+            qty_f = (balance * 0.9 * leverage) / mark_price
+
             qty_s = f"{qty_f:.6f}"
             log(f"⚠️ 調整 {symbol} 張數因餘額不足 → {qty_s}", "SYS")
 
