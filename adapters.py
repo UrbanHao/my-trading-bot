@@ -237,7 +237,20 @@ class LiveAdapter:
         sl_s    = f"{sl_f:.{price_prec}f}"
         tp_s    = f"{tp_f:.{price_prec}f}"
         qty_s   = f"{qty_f:.{qty_prec}f}"
+        # --- 安全檢查，避免 STOP_MARKET 立即觸發 (-2021) ---
+        current_price = self.best_price(symbol)
+        try:
+            cp = float(current_price)
+            sl_f = float(sl_s)
+        except Exception:
+            cp = 0.0
 
+        if is_bull and sl_f >= cp:
+            sl_f = round(cp * 0.998, price_prec)
+            sl_s = f"{sl_f:.{price_prec}f}"
+        elif (not is_bull) and sl_f <= cp:
+            sl_f = round(cp * 1.002, price_prec)
+            sl_s = f"{sl_f:.{price_prec}f}"
         # 進場：STOP_MARKET（不送 price，避免 -1111）
         params_entry = {
             "symbol": symbol,
