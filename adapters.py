@@ -11,22 +11,10 @@ try:
 except Exception:
     _ws_best_price = None
 from config import USE_TESTNET, ORDER_TIMEOUT_SEC,STOP_BUFFER_PCT, LIMIT_BUFFER_PCT
-from utils  import compute_stop_limit, conform_to_filters
+from utils import conform_to_filters
+from risk_frame import compute_stop_limit as rf_compute_stop_limit
 from journal import log_trade # <-- 確保匯入 log_trade
-from risk_frame import compute_stop_limit as _compute_stop_limit
-def compute_stop_limit(price, **kwargs):
-    """
-    本地轉接器：兼容舊呼叫（is_bull=...）與新呼叫（side=...）
-    之後統一轉成 side 交給 risk_frame 的 compute_stop_limit。
-    """
-    side = kwargs.get('side')
-    is_bull = kwargs.get('is_bull')
-    if side is None and is_bull is not None:
-        side = "LONG" if is_bull else "SHORT"
-    # 這裡只傳 price + side，其他額外 keyword 直接忽略（避免不相容）
-    return _compute_stop_limit(price, side=side)
-
-
+from risk_frame import compute_stop_limit as rf_compute_stop_limit
 class SimAdapter:
     def __init__(self):
         self.open = None
@@ -74,7 +62,7 @@ class SimAdapter:
             # 若外部傳字串，仍嘗試轉 float；失敗就退回最佳價
             ref_price = float(self.best_price(symbol))
 
-        stop_px, limit_px = compute_stop_limit(ref_price, is_bull, STOP_BUFFER_PCT, LIMIT_BUFFER_PCT)
+        stop_px, limit_px = rf_compute_stop_limit(ref_price, side=("LONG" if is_bull else "SHORT"), stop_offset_pct=STOP_BUFFER_PCT, limit_offset_pct=LIMIT_BUFFER_PCT)
 
         # 2) 以 limit 價作為模擬成交價；TP/SL 沿用呼叫端傳入
         self.open = {
