@@ -11,6 +11,8 @@ SESSION.headers.update({"User-Agent": "daily-gainer-bot/vC"})
 
 SESSION.headers.update({"Cache-Control": "no-cache"})
 EXCLUDE_KEYWORDS = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT", "BUSD")
+EXCHANGE_INFO = {}
+FUTURE_KEYS = set()
 
 def now_ts_ms():
     return int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -113,7 +115,7 @@ def safe_get_json(url: str, params=None, timeout=4, tries=2):
 from config import USE_TESTNET # 匯入 USE_TESTNET
 
 # 由於 config.py 中沒有定義測試網，我們在這裡定義
-BINANCE_FUTURES_TEST_BASE = "https://testnet.binancefuture.com"
+BINANCE_FUTURES_TEST_BASE = "https://testnet.binancefuture.com"  # ✅ 正確
 
 def _rest_json(path: str, params=None, timeout=5, tries=3):
     """對 Binance Futures REST 做單一主機 + 退避重試。
@@ -161,56 +163,46 @@ def update_time_offset():
         return TIME_OFFSET_MS
     except Exception:
         return TIME_OFFSET_MS # 同步失敗時，維持舊的 offset
-
-# 啟動時執行第一次校正
 update_time_offset()
-
-EXCHANGE_INFO = {}
 def _get_decimals_from_string(s: str) -> int:
-    """從 tickSize/stepSize 字串計算所需的小數位數"""
-    if 'e-' in s: # 處理科學記號, e.g., "1e-5"
-        try:
-            return int(s.split('e-')[-1])
-        except Exception:
-            return 8 # Fallback
-    
-    s = s.rstrip('0') # 移除尾隨的 0, e.g., "0.0100" -> "0.01"
-    
-    if '.' not in s:
-        return 0 # e.g., "1"
-    
-    return len(s.split('.')[-1])
+    try:
+        if 'e-' in s.lower():
+            return int(s.lower().split('e-')[-1])
+        s = s.rstrip('0').rstrip('.') if '.' in s else s
+        return len(s.split('.')[-1]) if '.' in s else 0
+    except Exception:
+        return 8
+
 # utils.py (修改後的版本)
 # utils.py
 def load_exchange_info(force_refresh=False):
     """
     抓回 Futures 的精度 + Filters（tickSize/stepSize/minNotional 等），快取於 EXCHANGE_INFO。
     """
-    global EXCHANGE_INFO
+    global EXCHANGE_INFO, FUTURE_KEYS
+
     if EXCHANGE_INFO and not force_refresh:
         return
+
     try:
         info = _rest_json("/fapi/v1/exchangeInfo")
         data = {}
-        # utils.py (修改後的版本)
+
         for s in info.get("symbols", []):
             if s.get("status") != "TRADING":
                 continue
-            
+
             filt = {f.get("filterType"): f for f in s.get("filters", [])}
             pf = filt.get("PRICE_FILTER", {})
             ls = filt.get("LOT_SIZE", {})
             mn = filt.get("MIN_NOTIONAL", {})
-            
-            # --- ↓↓↓ 這是關鍵修復 ↓↓↓ ---
+
             tick_str = pf.get('tickSize', '0.0001') or '0.0001'
             step_str = ls.get('stepSize', '1') or '1'
-            
+
             data[s["symbol"]] = {
-                "pricePrecision":    _get_decimals_from_string(tick_str), # 從 tickSize 推導
-                "quantityPrecision": _get_decimals_from_string(step_str), # 從 stepSize 推導
-            # --- ↑↑↑ 結束修復 ↑↑↑ ---
-                
+                "pricePrecision":    _get_decimals_from_string(tick_str),
+                "quantityPrecision": _get_decimals_from_string(step_str),
                 "tickSize":    float(tick_str),
                 "minPrice":    float(pf.get("minPrice", "0") or 0),
                 "maxPrice":    float(pf.get("maxPrice", "0") or 0),
@@ -219,11 +211,28 @@ def load_exchange_info(force_refresh=False):
                 "maxQty":      float(ls.get("maxQty", "0") or 0),
                 "minNotional": float(mn.get("notional", "5") or 5),
             }
-        EXCHANGE_INFO = data
+
+        # ✅ 正確更新全域內容（保留原物件參照）
+        EXCHANGE_INFO.clear()
+        EXCHANGE_INFO.update(data)
+        FUTURE_KEYS.clear()
+        FUTURE_KEYS.update(k.upper() for k in EXCHANGE_INFO.keys())
+
         print(f"--- 成功載入 {len(EXCHANGE_INFO)} 個幣種的精度與過濾規則 ---")
+
     except Exception as e:
-        print(f"--- 致命錯誤：無法載入 Exchange Info: {e} ---")
+        print(f"[REST_ERR] load_exchange_info: {e}")
         print("--- 程式可能因無法獲取精度而下單失敗 ---")
+
+def is_futures_symbol(symbol: str) -> bool:
+    global FUTURE_KEYS
+    if not FUTURE_KEYS:
+        load_exchange_info(force_refresh=False)
+    # 再次檢查更新後內容
+    return symbol.upper() in FUTURE_KEYS or symbol.upper() in set(EXCHANGE_INFO.keys())
+
+
+
         
 def conform_to_filters(symbol: str, price: float, qty: float):
     """
@@ -378,28 +387,25 @@ def last_close(k1m):
 # === futures-only 版本，僅給掃描/下單使用；不影響面板顯示 ===
 def fetch_top_gainers_fut(limit=10):
     """
-    從現有的 fetch_top_gainers 抓比較多，然後只保留 EXCHANGE_INFO 內可交易的 USDT 合約。
-    回傳格式與原函式完全相同：(symbol, pct(百分數), last, volume)
+    從原本的 fetch_top_gainers 抓多一點，再只保留期貨可交易的；格式不變。
     """
-    # 抓多一點，避免被過濾後太少
-    raw = fetch_top_gainers(limit=60)
-    fut = []
+    raw = fetch_top_gainers(limit=100)  # 多抓，避免被過濾後不足
+    out = []
     for s, pct, last, vol in raw:
-        if s.upper() in EXCHANGE_INFO:  # 只保留期貨清單內的交易對
-            fut.append((s, pct, last, vol))
-            if len(fut) >= limit:
+        if s.upper() in FUTURE_KEYS:
+            out.append((s, pct, last, vol))
+            if len(out) >= limit:
                 break
-    return fut
+    return out
 
 def fetch_top_losers_fut(limit=10):
-    """
-    跌幅榜同理，從現有函式抓多一點再過濾，只留 EXCHANGE_INFO 內的。
-    """
-    raw = fetch_top_losers(limit=60)
-    fut = []
+    raw = fetch_top_losers(limit=100)
+    out = []
     for s, pct, last, vol in raw:
-        if s.upper() in EXCHANGE_INFO:
-            fut.append((s, pct, last, vol))
-            if len(fut) >= limit:
+        if s.upper() in FUTURE_KEYS:
+            out.append((s, pct, last, vol))
+            if len(out) >= limit:
                 break
-    return fut
+    return out
+
+

@@ -18,10 +18,13 @@ import threading
 from journal import log_trade
 import sys, threading, termios, tty, select, math
 import requests
-from utils import fetch_top_gainers_fut, fetch_top_losers_fut
+from utils import (
+    fetch_top_gainers_fut, fetch_top_losers_fut,
+    is_futures_symbol, load_exchange_info
+)
 from signals.signal_scalp_breakout import scalp_breakout_signal
 from signals.signal_scalp_vwap import scalp_vwap_signal
-
+load_exchange_info(force_refresh=True)
 
 def state_iter():
     # hotkeys local imports (ensure available even if top-level imports failed)
@@ -205,22 +208,24 @@ def state_iter():
                 try:
                     ws_syms = []
 
-                    # 2a) 抓取 Gainers / Losers（面板顯示仍用原函式）
+                    # 2a) 抓取 Gainers / Losers（遵守 ENABLE_LONG / ENABLE_SHORT）
                     if ENABLE_LONG:
-                        top10 = fetch_top_gainers(10)            # 給面板用：維持原樣（可能含現貨/非期貨）
-                        top10_fut = fetch_top_gainers_fut(10)     # 給策略用：只留 EXCHANGE_INFO 內可交易的期貨
-                        ws_syms.extend([t[0] for t in top10_fut])  # 訂閱真正會用到的
+                        top10 = fetch_top_gainers(10)          # 面板顯示照舊
+                        ws_syms.extend([t[0] for t in top10])
                         log("top10_gainers ok", "SCAN")
                     else:
-                        top10, top10_fut = [], []
+                        top10 = []
 
                     if ENABLE_SHORT:
-                        top10_losers = fetch_top_losers(10)              # 面板
-                        top10_losers_fut = fetch_top_losers_fut(10)      # 策略（僅期貨）
-                        ws_syms.extend([t[0] for t in top10_losers_fut])
+                        top10_losers = fetch_top_losers(10)    # 面板顯示照舊
+                        ws_syms.extend([t[0] for t in top10_losers])
                         log("top10_losers ok", "SCAN")
                     else:
-                        top10_losers, top10_losers_fut = [], []
+                        top10_losers = []
+
+                    # 另取候選（僅期貨可交易）
+                    gainers_fut = fetch_top_gainers_fut(20)    # 抓寬一點，讓策略好挑
+                    losers_fut  = fetch_top_losers_fut(20)
 
                     last_scan = t_now
 
@@ -232,7 +237,7 @@ def state_iter():
                     # === 路由：Scalp 模式 ===
                     if SCALP_MODE in ("breakout", "vwap"):
                         # 下單 universe 只用「期貨版」清單；面板仍顯示原始 top10
-                        universe = top10_fut + top10_losers_fut
+                        universe = gainers_fut + losers_fut
                         for s, pct, last, vol in universe:
                             if t_now < cooldown['symbol_lock'].get(s, 0):
                                 continue
@@ -253,7 +258,7 @@ def state_iter():
                     # === 路由：原本的 volume 策略（預設） ===
                     else:
                         if ENABLE_LONG and (t_now > cooldown["until"]):
-                            for s, pct, last, vol in top10_fut:
+                            for s, pct, last, vol in gainers_fut:
                                 if t_now < cooldown['symbol_lock'].get(s, 0):
                                     continue
                                 if volume_breakout_ok(s):
@@ -263,7 +268,7 @@ def state_iter():
                                     break
 
                         if (not candidate) and ENABLE_SHORT and (t_now > cooldown["until"]):
-                            for s, pct, last, vol in top10_losers_fut:
+                            for s, pct, last, vol in losers_fut:
                                 if t_now < cooldown['symbol_lock'].get(s, 0):
                                     continue
                                 if volume_breakdown_ok(s):
@@ -285,9 +290,9 @@ def state_iter():
                 if candidate:
                     symbol, entry = candidate
                     # 最終保險：僅允許交易所期貨清單內的符號
-                    if symbol.upper() not in EXCHANGE_INFO:
+                    if not is_futures_symbol(symbol):
                         log(f"Skipping {symbol}: not in futures exchangeInfo", "SCAN")
-                        cooldown["symbol_lock"][symbol] = time.time() + 60  # 60 秒內不要再碰它
+                        cooldown["symbol_lock"][symbol] = time.time() + 60
                         continue
 
                     # 'side' 變數已在上面的掃描邏輯中設定 (LONG 或 SHORT)
