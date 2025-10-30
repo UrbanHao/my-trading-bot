@@ -290,16 +290,20 @@ def state_iter():
                 if candidate:
                     symbol, entry = candidate
 
-                    # 最終保險：僅允許交易所期貨清單內的符號
+                    # 避免重複下單同一標的
+                    if adapter.has_open() and adapter.open and adapter.open.get("symbol") == symbol:
+                        log.info(f"Skipping {symbol}: already have open position")
+                        continue
+
+                    # 僅允許交易所期貨清單內的符號
                     if not is_futures_symbol(symbol):
-                        log(f"Skipping {symbol}: not in futures exchangeInfo", "SCAN")
+                        log.info(f"Skipping {symbol}: not in futures exchangeInfo")
                         cooldown["symbol_lock"][symbol] = time.time() + 60
                         continue
 
                     notional = position_size_notional(equity)
 
                     try:
-                        # 計算 TP/SL、對齊交易所規則
                         sl_raw, tp_raw = compute_bracket(entry, side)
                         qty_raw = notional / max(entry, 1e-9)
 
@@ -308,16 +312,16 @@ def state_iter():
                         tp_f,    _,     _,          _        = conform_to_filters(symbol, tp_raw, qty_raw)
 
                     except ValueError as e:
-                        log(f"Skipping {symbol}: {e}", "ERR")
+                        log.error(f"Skipping {symbol}: {e}")
                         cooldown["symbol_lock"][symbol] = time.time() + 60
                         candidate = None
                     except Exception as e:
-                        log(f"Filter/Conform error for {symbol}: {e}", "ERR")
+                        log.error(f"Filter/Conform error for {symbol}: {e}")
                         candidate = None
 
                     if candidate:
                         if qty_f == 0.0:
-                            log(f"Skipping {symbol}, calculated qty is zero (Notional={notional:.2f})", "SYS")
+                            log.info(f"Skipping {symbol}, calculated qty is zero (Notional={notional:.2f})")
                         else:
                             entry_s = f"{entry_f:.{price_prec}f}"
                             qty_s   = f"{qty_f:.{qty_prec}f}"
@@ -325,45 +329,45 @@ def state_iter():
                             tp_s    = f"{tp_f:.{price_prec}f}"
 
                             try:
-                                # 先鎖一下，避免同一秒重複打
                                 cooldown["symbol_lock"][symbol] = time.time() + 10
 
-                                # ✅ 入場前，先清乾淨舊掛單（避免「越掛越多」）
                                 try:
                                     if hasattr(adapter, "cancel_open_orders"):
                                         adapter.cancel_open_orders(symbol)
                                 except Exception:
                                     pass
 
-                                # ✅ 一次性流程：市價進場 + 掛 reduceOnly 的 TP/SL（都在 adapter 內完成）
                                 adapter.place_bracket(symbol, side, qty_s, entry_s, sl_s, tp_s)
 
-                                position_view = {"symbol": symbol, "side": side, "qty": qty_f,
-                                                 "entry": entry_f, "sl": sl_f, "tp": tp_f}
-                                log(f"OPEN {symbol} qty={qty_f} entry={entry_f:.6f} | {reason}", "ORDER")
+                                position_view = {
+                                    "symbol": symbol,
+                                    "side": side,
+                                    "qty": qty_f,
+                                    "entry": entry_f,
+                                    "sl": sl_f,
+                                    "tp": tp_f
+                                }
 
-                                # 冷卻與重入鎖
+                                log.info(f"OPEN {symbol} qty={qty_f} entry={entry_f:.6f}")
+
                                 cooldown["until"] = time.time() + COOLDOWN_SEC
                                 cooldown["symbol_lock"][symbol] = time.time() + REENTRY_BLOCK_SEC
-                                open_ts = time.time()  # 記錄開倉時間（給 time-stop 用）
+                                open_ts = time.time()
 
                             except requests.exceptions.HTTPError as e:
                                 try:
                                     server_msg = e.response.json()
                                     code = server_msg.get("code")
                                     msg = server_msg.get("msg")
-                                    log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
-                                    log(f"SERVER MSG: {msg} (Code: {code})", "ERROR")
-                                    # 如果是 -2021 之類立即觸發，延長鎖
+                                    log.error(f"ORDER FAILED for {symbol}: {e}")
+                                    log.error(f"SERVER MSG: {msg} (Code: {code})")
                                     if code == -2021:
                                         cooldown["symbol_lock"][symbol] = time.time() + 180
                                 except Exception:
-                                    log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
-                                    log(f"SERVER MSG: {e.response.text}", "ERROR")
+                                    log.error(f"ORDER FAILED for {symbol}: {e}")
+                                    log.error(f"SERVER MSG: {e.response.text}")
                             except Exception as e:
-                                log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
-
-
+                                log.error(f"ORDER FAILED for {symbol}: {e}")
 
         # 3) 更新顯示用 Equity
         account["equity"] = equity

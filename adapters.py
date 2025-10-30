@@ -219,7 +219,7 @@ class LiveAdapter:
     def cancel_open_orders(self, symbol: str):
         """取消該 symbol 的所有未成交掛單（含殘留 TP/SL），避免越掛越多。"""
         try:
-            self._delete("/fapi/v1/allOpenOrders", {"symbol": symbol})
+            return self._cancel_all_symbol_orders(symbol)
         except Exception:
             # 沒有掛單時 API 可能回錯，安全忽略
             pass
@@ -281,7 +281,11 @@ class LiveAdapter:
             raise ValueError(f"symbol not tradable or not found in exchangeInfo: {symbol}")
 
         self._cancel_all_symbol_orders(symbol)
-
+        # 先清該標的舊掛單
+        try:
+            self._cancel_all_symbol_orders(symbol)
+        except Exception as e:
+            log.error(f"[ENTRY] clear old orders failed for {symbol}: {e}")
         side_u = side.upper()
         is_bull = (side_u == "LONG")
         qty_f = float(qty_s)
@@ -295,6 +299,8 @@ class LiveAdapter:
         notional = qty_f * mark_price / leverage
         if notional > balance * 0.95:
             qty_f = (balance * 0.9 * leverage) / mark_price
+            qty_s = f"{qty_f:.6f}"
+            log.info(f"[ENTRY] Adjust qty for {symbol} due to balance: qty={qty_s}")
 
             qty_s = f"{qty_f:.6f}"
             log(f"⚠️ 調整 {symbol} 張數因餘額不足 → {qty_s}", "SYS")
@@ -346,14 +352,14 @@ class LiveAdapter:
                 pass
             return False, None, None, None, None
 
-        # 命中 TP 或 SL → 平倉
+        # 命中 TP 或 SL → 強制平倉
         exit_price = self.open["tp"] if hit_tp else self.open["sl"]
         pct = (exit_price - entry) / entry
-        if side == "SHORT": pct = -pct
+        if side == "SHORT":
+            pct = -pct
         reason = "TP" if hit_tp else "SL"
 
         try:
-            # 強制平倉現有倉位
             self._post("/fapi/v1/order", {
                 "symbol": symbol,
                 "side": ("SELL" if side == "LONG" else "BUY"),
@@ -362,7 +368,7 @@ class LiveAdapter:
                 "newClientOrderId": f"close_{int(time.time()*1000)}",
             })
         except Exception as e:
-            log(f"⚠️ 強制平倉失敗 {symbol}: {e}", "ERROR")
+            log.error(f"⚠️ 強制平倉失敗 {symbol}: {e}")
 
         # 取消殘單
         try:
@@ -370,7 +376,7 @@ class LiveAdapter:
         except Exception:
             pass
 
-        log(f"💰 {reason} HIT for {symbol}, +{pct*100:.2f}%", "ORDER")
+        log.info(f"💰 {reason} HIT for {symbol}, +{pct*100:.2f}%")
         trade_data = self.open
         self.open = None
         day_guard.on_trade_close(pct)
@@ -387,18 +393,20 @@ class LiveAdapter:
             )
         except Exception:
             pass
+
         return True, pct, symbol, reason, exit_price
+
 
     def _cancel_all_symbol_orders(self, symbol: str):
         """
-        取消該標的所有未成交掛單（包含止盈止損）
-        避免每輪補單造成越掛越多。
+        取消該標的所有未成交掛單（包含止盈止損）。
+        避免越掛越多的 leftover orders。
         """
         try:
             r = self._delete("/fapi/v1/allOpenOrders", {"symbol": symbol})
             log.info(f"[CANCEL] cleared all open orders for {symbol}")
             return r
         except Exception as e:
-            # 沒單 / 或 API 回覆 4xx 都當無事發生，避免阻斷流程
             log.error(f"[CANCEL] failed to clear open orders for {symbol}: {e}")
             return None
+
