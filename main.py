@@ -289,15 +289,14 @@ def state_iter():
                 # 2d) 執行下單（共用原本下單流程與風控）
                 if candidate:
                     symbol, entry = candidate
+
                     # 最終保險：僅允許交易所期貨清單內的符號
                     if not is_futures_symbol(symbol):
                         log(f"Skipping {symbol}: not in futures exchangeInfo", "SCAN")
                         cooldown["symbol_lock"][symbol] = time.time() + 60
                         continue
 
-                    # 'side' 變數已在上面的掃描邏輯中設定 (LONG 或 SHORT)
                     notional = position_size_notional(equity)
-
 
                     try:
                         # 計算 TP/SL、對齊交易所規則
@@ -305,8 +304,8 @@ def state_iter():
                         qty_raw = notional / max(entry, 1e-9)
 
                         entry_f, qty_f, price_prec, qty_prec = conform_to_filters(symbol, entry, qty_raw)
-                        sl_f, _, _, _ = conform_to_filters(symbol, sl_raw, qty_raw)
-                        tp_f, _, _, _ = conform_to_filters(symbol, tp_raw, qty_raw)
+                        sl_f,    _,     _,          _        = conform_to_filters(symbol, sl_raw, qty_raw)
+                        tp_f,    _,     _,          _        = conform_to_filters(symbol, tp_raw, qty_raw)
 
                     except ValueError as e:
                         log(f"Skipping {symbol}: {e}", "ERR")
@@ -326,39 +325,21 @@ def state_iter():
                             tp_s    = f"{tp_f:.{price_prec}f}"
 
                             try:
-                                # === 🧱 新增：入場前防呆檢查，避免立即觸發 (-2021) ===
-                                try:
-                                    mp = adapter._get("/fapi/v1/premiumIndex", {"symbol": symbol})
-                                    mark_price = float(mp["markPrice"])
-                                except Exception:
-                                    r = SESSION.get(f"{adapter.base}/fapi/v1/ticker/price",
-                                                    params={"symbol": symbol}, timeout=5)
-                                    r.raise_for_status()
-                                    mark_price = float(r.json()["price"])
+                                # 先鎖一下，避免同一秒重複打
+                                cooldown["symbol_lock"][symbol] = time.time() + 10
 
-                                will_immediately_trigger = (
-                                    (side.upper() == "LONG" and entry_f <= mark_price)
-                                    or (side.upper() == "SHORT" and entry_f >= mark_price)
-                                )
-                                if will_immediately_trigger:
-                                    log(f"Skip {symbol}: entry would immediately trigger (entry={entry_f}, mark={mark_price})", "SCAN")
-                                    cooldown["symbol_lock"][symbol] = time.time() + 60
-                                    candidate = None
-                                    continue  # <== 跳過這筆下單
-
-                                # === 原本的下單邏輯從這裡繼續 ===
-                                cooldown["symbol_lock"][symbol] = time.time() + 10  # 先鎖10秒，避免爆衝
+                                # ✅ 入場前，先清乾淨舊掛單（避免「越掛越多」）
                                 try:
-                                    # 若 adapter 有內建清掛單功能，先清掉舊掛單
                                     if hasattr(adapter, "cancel_open_orders"):
                                         adapter.cancel_open_orders(symbol)
                                 except Exception:
                                     pass
 
+                                # ✅ 一次性流程：市價進場 + 掛 reduceOnly 的 TP/SL（都在 adapter 內完成）
                                 adapter.place_bracket(symbol, side, qty_s, entry_s, sl_s, tp_s)
-                                position_view = {"symbol": symbol, "side": side,
-                                                 "qty": qty_f, "entry": entry_f,
-                                                 "sl": sl_f, "tp": tp_f}
+
+                                position_view = {"symbol": symbol, "side": side, "qty": qty_f,
+                                                 "entry": entry_f, "sl": sl_f, "tp": tp_f}
                                 log(f"OPEN {symbol} qty={qty_f} entry={entry_f:.6f} | {reason}", "ORDER")
 
                                 # 冷卻與重入鎖
@@ -373,7 +354,7 @@ def state_iter():
                                     msg = server_msg.get("msg")
                                     log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
                                     log(f"SERVER MSG: {msg} (Code: {code})", "ERROR")
-                                    # 🧱 若為 -2021，鎖 180 秒，避免重複下錯單
+                                    # 如果是 -2021 之類立即觸發，延長鎖
                                     if code == -2021:
                                         cooldown["symbol_lock"][symbol] = time.time() + 180
                                 except Exception:
@@ -381,6 +362,7 @@ def state_iter():
                                     log(f"SERVER MSG: {e.response.text}", "ERROR")
                             except Exception as e:
                                 log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
+
 
 
         # 3) 更新顯示用 Equity
