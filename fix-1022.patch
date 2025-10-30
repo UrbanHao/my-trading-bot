@@ -1,0 +1,52 @@
+*** a/adapters.py
+--- b/adapters.py
+@@
+-    def _sign(self, params:dict):
+-        q = "&".join([f"{k}={params[k]}" for k in sorted(params.keys())])
+-        sig = hmac.new(self.secret.encode(), q.encode(), hashlib.sha256).hexdigest()
+-        return q + "&signature=" + sig
++    def _sign(self, params:dict):
++        """
++        用實際會發送的 URL 編碼參數做簽名，避免含非 ASCII 字元（或需要編碼的值）時出現 -1022。
++        """
++        from urllib.parse import urlencode
++        # 以排序後的 items 產生穩定字串；用 urlencode 產生實際 query
++        q = urlencode(sorted(params.items()), doseq=True)
++        sig = hmac.new(self.secret.encode(), q.encode(), hashlib.sha256).hexdigest()
++        return q + "&signature=" + sig
+@@
+-        symbol = symbol.upper()
++        # 僅允許交易所存在且為 ASCII 的標的，避免中文名稱造成 URL 編碼與簽名不一致
++        symbol = symbol.upper().strip()
++        if symbol not in EXCHANGE_INFO:
++            raise ValueError(f"symbol not tradable or not found in exchangeInfo: {symbol}")
+         side_u = side.upper()
+         is_bull = (side_u == "LONG")
+*** a/main.py
+--- b/main.py
+@@
+-                    if ENABLE_LONG:
+-                        top10 = fetch_top_gainers(10)
++                    if ENABLE_LONG:
++                        top10 = fetch_top_gainers(10)
++                        # 僅保留交易所存在的英數符號（過濾掉中文/別名）
++                        top10 = [(s, pct, last, vol) for (s, pct, last, vol) in top10 if s.upper() in EXCHANGE_INFO]
+                         last_scan = t_now # <--- last_scan 移到這裡
+                         log("top10_gainers ok", "SCAN")
+-                        ws_syms.extend([t[0] for t in top10]) # 加入 WS 訂閱
++                        ws_syms.extend([t[0] for t in top10]) # 加入 WS 訂閱
+                     else:
+                         top10 = [] # 如果沒啟用 LONG，清空
+@@
+-                    if ENABLE_SHORT:
+-                        # (注意：我們把 top10_losers 的抓取移出 if not candidate)
+-                        top10_losers = fetch_top_losers(10)
++                    if ENABLE_SHORT:
++                        # (注意：我們把 top10_losers 的抓取移出 if not candidate)
++                        top10_losers = fetch_top_losers(10)
++                        # 同樣過濾成交易所合法符號
++                        top10_losers = [(s, pct, last, vol) for (s, pct, last, vol) in top10_losers if s.upper() in EXCHANGE_INFO]
+                         log("top10_losers ok", "SCAN")
+                         ws_syms.extend([t[0] for t in top10_losers]) # <--- 新增
+                     else:
+                         top10_losers = [] # 如果沒啟用 SHORT，清空

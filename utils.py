@@ -374,3 +374,32 @@ def zscore_price_vs_vwap(k1m, lookback=20):
 
 def last_close(k1m):
     return k1m[-1][3] if k1m else None
+
+# === futures-only 版本，僅給掃描/下單使用；不影響面板顯示 ===
+def fetch_top_gainers_fut(limit=10):
+    """
+    從現有的 fetch_top_gainers 抓比較多，然後只保留 EXCHANGE_INFO 內可交易的 USDT 合約。
+    回傳格式與原函式完全相同：(symbol, pct(百分數), last, volume)
+    """
+    # 抓多一點，避免被過濾後太少
+    raw = fetch_top_gainers(limit=60)
+    fut = []
+    for s, pct, last, vol in raw:
+        if s.upper() in EXCHANGE_INFO:  # 只保留期貨清單內的交易對
+            fut.append((s, pct, last, vol))
+            if len(fut) >= limit:
+                break
+    return fut
+
+def fetch_top_losers_fut(limit=10):
+    """
+    跌幅榜同理，從現有函式抓多一點再過濾，只留 EXCHANGE_INFO 內的。
+    """
+    raw = fetch_top_losers(limit=60)
+    fut = []
+    for s, pct, last, vol in raw:
+        if s.upper() in EXCHANGE_INFO:
+            fut.append((s, pct, last, vol))
+            if len(fut) >= limit:
+                break
+    return fut
