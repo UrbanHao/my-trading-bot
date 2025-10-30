@@ -409,3 +409,7 @@ def fetch_top_losers_fut(limit=10):
     return out
 
 
+
+def log(msg: str, level: str = "INFO"):
+    now = time.strftime("%H:%M:%S")
+    print(f"{now} [{level}] {msg}")

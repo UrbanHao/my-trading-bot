@@ -286,23 +286,21 @@ def state_iter():
                     candidate = None
 
 
-                # 2d) 執行下單（共用原本下單流程與風控）
+                # 2d) 執行下單（使用 LiveAdapter 一次性完成：市價進場 + 掛 TP/SL）
                 if candidate:
                     symbol, entry = candidate
 
-                    # 避免重複下單同一標的
+                    # 若已有相同 symbol 的倉位，略過（防止重複開倉）
                     if adapter.has_open() and adapter.open and adapter.open.get("symbol") == symbol:
-                        log.info(f"Skipping {symbol}: already have open position")
+                        log(f"Skipping {symbol}: already has open position", "SYS")
                         continue
 
-                    # 僅允許交易所期貨清單內的符號
                     if not is_futures_symbol(symbol):
-                        log.info(f"Skipping {symbol}: not in futures exchangeInfo")
+                        log(f"Skipping {symbol}: not in futures exchangeInfo", "SCAN")
                         cooldown["symbol_lock"][symbol] = time.time() + 60
                         continue
 
                     notional = position_size_notional(equity)
-
                     try:
                         sl_raw, tp_raw = compute_bracket(entry, side)
                         qty_raw = notional / max(entry, 1e-9)
@@ -310,71 +308,58 @@ def state_iter():
                         entry_f, qty_f, price_prec, qty_prec = conform_to_filters(symbol, entry, qty_raw)
                         sl_f,    _,     _,          _        = conform_to_filters(symbol, sl_raw, qty_raw)
                         tp_f,    _,     _,          _        = conform_to_filters(symbol, tp_raw, qty_raw)
-
-                    except ValueError as e:
-                        log.error(f"Skipping {symbol}: {e}")
-                        cooldown["symbol_lock"][symbol] = time.time() + 60
-                        candidate = None
                     except Exception as e:
-                        log.error(f"Filter/Conform error for {symbol}: {e}")
+                        log(f"Filter/Conform error for {symbol}: {e}", "ERR")
                         candidate = None
 
-                    if candidate:
-                        if qty_f == 0.0:
-                            log.info(f"Skipping {symbol}, calculated qty is zero (Notional={notional:.2f})")
-                        else:
-                            entry_s = f"{entry_f:.{price_prec}f}"
-                            qty_s   = f"{qty_f:.{qty_prec}f}"
-                            sl_s    = f"{sl_f:.{price_prec}f}"
-                            tp_s    = f"{tp_f:.{price_prec}f}"
+                    if candidate and qty_f > 0.0:
+                        entry_s = f"{entry_f:.{price_prec}f}"  # 僅作顯示，不再作條件單觸發
+                        qty_s   = f"{qty_f:.{qty_prec}f}"
+                        sl_s    = f"{sl_f:.{price_prec}f}"
+                        tp_s    = f"{tp_f:.{price_prec}f}"
 
+                        try:
+                            cooldown["symbol_lock"][symbol] = time.time() + 5
+                            # 入場前清殘單 → 市價進場 → 補掛 SL/TP（都在 adapter 內處理）
+                            if hasattr(adapter, "cancel_open_orders"):
+                                adapter.cancel_open_orders(symbol)
+                            adapter.place_bracket(symbol, side, qty_s, entry_s, sl_s, tp_s)
+
+                            # 面板顯示
+                            position_view = {
+                                "symbol": symbol, "side": side, "qty": qty_f,
+                                "entry": adapter.open["entry"], "sl": sl_f, "tp": tp_f
+                            }
+                            log(f"OPEN {symbol} qty={qty_f} entry≈{position_view['entry']:.6f} | {reason}", "ORDER")
+
+                            cooldown["until"] = time.time() + COOLDOWN_SEC
+                            cooldown["symbol_lock"][symbol] = time.time() + REENTRY_BLOCK_SEC
+                            open_ts = time.time()
+                        except requests.exceptions.HTTPError as e:
                             try:
-                                cooldown["symbol_lock"][symbol] = time.time() + 10
-
-                                try:
-                                    if hasattr(adapter, "cancel_open_orders"):
-                                        adapter.cancel_open_orders(symbol)
-                                except Exception:
-                                    pass
-
-                                adapter.place_bracket(symbol, side, qty_s, entry_s, sl_s, tp_s)
-
-                                position_view = {
-                                    "symbol": symbol,
-                                    "side": side,
-                                    "qty": qty_f,
-                                    "entry": entry_f,
-                                    "sl": sl_f,
-                                    "tp": tp_f
-                                }
-
-                                log.info(f"OPEN {symbol} qty={qty_f} entry={entry_f:.6f}")
-
-                                cooldown["until"] = time.time() + COOLDOWN_SEC
-                                cooldown["symbol_lock"][symbol] = time.time() + REENTRY_BLOCK_SEC
-                                open_ts = time.time()
-
-                            except requests.exceptions.HTTPError as e:
-                                try:
-                                    server_msg = e.response.json()
-                                    code = server_msg.get("code")
-                                    msg = server_msg.get("msg")
-                                    log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
-                                    log(f"SERVER MSG: {msg} (Code: {code})", "ERROR")
-                                    if code == -2021:
-                                        cooldown["symbol_lock"][symbol] = time.time() + 180
-                                except Exception:
-                                    log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
-                                    log(f"SERVER MSG: {e.response.text}", "ERROR")
-                            except Exception as e:
+                                server_msg = e.response.json()
+                                code = server_msg.get("code")
+                                msg  = server_msg.get("msg")
                                 log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
+                                log(f"SERVER MSG: {msg} (Code: {code})", "ERROR")
+                            except Exception:
+                                log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
+                                log(f"SERVER MSG: {e.response.text}", "ERROR")
+                        except Exception as e:
+                            log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
+                    else:
+                        log(f"Skipping {symbol}, qty==0 (Notional={notional:.2f})", "SYS")
 
 
         # 3) 更新顯示用 Equity
         account["equity"] = equity
         if USE_LIVE and account.get("balance") is None:
             account["balance"] = equity
-
+            try:
+                if hasattr(adapter, "sync_state"):
+                    adapter.sync_state()
+            except Exception:
+                pass
         # 4) 輸出給面板
         yield {
             "top10": top10,

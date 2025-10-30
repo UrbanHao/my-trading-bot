@@ -1,12 +1,14 @@
 import os, hmac, hashlib, time, logging
 from decimal import Decimal, ROUND_DOWN
+import requests
 
 from utils import (
     now_ts_ms, SESSION, BINANCE_FUTURES_BASE, TIME_OFFSET_MS,
-    ws_best_price, EXCHANGE_INFO, load_exchange_info, conform_to_filters
+    EXCHANGE_INFO, load_exchange_info, log
 )
 import config
 from config import USE_TESTNET, ORDER_TIMEOUT_SEC, STOP_BUFFER_PCT, LIMIT_BUFFER_PCT
+
 from journal import log_trade
 
 try:
@@ -134,28 +136,33 @@ class SimAdapter:
         return False, None, None, None, None
 
 # ================================== 實單 Adapter ==================================
+def _fmt(v: float, prec: int) -> str:
+    return f"{v:.{prec}f}"
+
+def _floor_to_step(val: float, step: float, prec: int) -> float:
+    if step and step > 0:
+        q = Decimal(str(step))
+        v = (Decimal(str(val)) / q).to_integral_value(rounding=ROUND_DOWN) * q
+    else:
+        v = Decimal(str(val))
+    return float(f"{v:.{prec}f}")
+
 class LiveAdapter:
     """
-    真實下單流程（不破壞你現有功能）：
-    1) 先用 MARKET 進場（BUY/SELL），確保一定有部位（不再只有TP/SL孤兒單）。
-    2) 成交後，補掛 reduceOnly 的 STOP_MARKET(SL) 與 TAKE_PROFIT_MARKET(TP)。
-    3) 任一保護單成交 -> 立刻取消另一張（避免殘留越掛越多）。
-    4) 入場前會先清掉該 symbol 所有未成交委託（安全閥）。
+    進場：MARKET
+    立即補掛：STOP_MARKET (SL, closePosition=true) + TAKE_PROFIT_MARKET (TP, closePosition=true)
+    關鍵原則：以「交易所實際倉位與委託狀態」為唯一真相，面板只讀取同步狀態。
     """
 
     def __init__(self):
         self.key = os.getenv("BINANCE_API_KEY", "")
         self.secret = os.getenv("BINANCE_SECRET", "")
-        BINANCE_FUTURES_TEST_BASE = "https://testnet.binancefuture.com"
         self.base = (BINANCE_FUTURES_TEST_BASE if USE_TESTNET else BINANCE_FUTURES_BASE)
-        # self.open: 紀錄目前部位&保護單 id，方便後續取消
-        self.open = None
-        self.default_leverage = 10  # ✅ 新增這行
+        self.open = None  # {"symbol","side","qty","entry","sl","tp"}
+        load_exchange_info()
 
-
-    # ---------- 低階 API ----------
+    # ---------------- low-level http ----------------
     def _sign(self, params: dict):
-        # 用實際會發送的 URL 編碼字串簽名，避免 -1022
         from urllib.parse import urlencode
         q = urlencode(sorted(params.items()), doseq=True)
         sig = hmac.new(self.secret.encode(), q.encode(), hashlib.sha256).hexdigest()
@@ -170,7 +177,7 @@ class LiveAdapter:
         r.raise_for_status()
         return r.json()
 
-    def _get(self, path, params):
+    def _get(self, path, params=None):
         params = dict(params or {})
         params["timestamp"] = now_ts_ms() + int(TIME_OFFSET_MS)
         params.setdefault("recvWindow", 60000)
@@ -179,7 +186,7 @@ class LiveAdapter:
         r.raise_for_status()
         return r.json()
 
-    def _delete(self, path, params):
+    def _delete(self, path, params=None):
         params = dict(params or {})
         params["timestamp"] = now_ts_ms() + int(TIME_OFFSET_MS)
         params.setdefault("recvWindow", 60000)
@@ -188,7 +195,10 @@ class LiveAdapter:
         r.raise_for_status()
         return r.json()
 
-    # ---------- 查餘額 / 最佳價 ----------
+    # ---------------- public helpers ----------------
+    def has_open(self):
+        return self.open is not None
+
     def balance_usdt(self) -> float:
         arr = self._get("/fapi/v2/balance", {})
         for a in arr:
@@ -200,187 +210,175 @@ class LiveAdapter:
                     return 0.0
         return 0.0
 
-    def has_open(self):
-        return self.open is not None
-
     def best_price(self, symbol: str) -> float:
-        if _ws_best_price:
-            try:
-                p = _ws_best_price(symbol)
-                if p is not None:
-                    return float(p)
-            except Exception:
-                pass
         r = SESSION.get(f"{self.base}/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=5)
         r.raise_for_status()
         return float(r.json()["price"])
 
-    # ---------- 公用：取消該標的所有未成交委託 ----------
-    def cancel_open_orders(self, symbol: str):
-        """取消該 symbol 的所有未成交掛單（含殘留 TP/SL），避免越掛越多。"""
-        try:
-            return self._cancel_all_symbol_orders(symbol)
-        except Exception:
-            # 沒有掛單時 API 可能回錯，安全忽略
-            pass
-
-    # ---------- 內部：查淨部位數量 / 列出掛單 / 取消指定掛單 ----------
+    # ---------------- exchange state ----------------
     def _position_amt(self, symbol: str) -> float:
-        """>0 多倉；<0 空倉；=0 無倉"""
         arr = self._get("/fapi/v2/positionRisk", {"symbol": symbol})
-        if isinstance(arr, list) and arr:
-            pos = arr[0]
-        else:
-            pos = arr
-        try:
-            return float(pos.get("positionAmt") or 0.0)
-        except Exception:
-            return 0.0
+        if isinstance(arr, list):
+            for it in arr:
+                if it.get("symbol") == symbol:
+                    return float(it.get("positionAmt") or "0")
+        return 0.0
 
-    def _orders_by_symbol(self, symbol: str):
+    def _avg_entry_price(self, symbol: str) -> float:
+        arr = self._get("/fapi/v2/positionRisk", {"symbol": symbol})
+        if isinstance(arr, list):
+            for it in arr:
+                if it.get("symbol") == symbol:
+                    p = it.get("entryPrice") or "0"
+                    try: return float(p)
+                    except: return 0.0
+        return 0.0
+
+    def _open_orders(self, symbol: str):
         try:
             return self._get("/fapi/v1/openOrders", {"symbol": symbol})
-        except Exception:
+        except:
             return []
 
-    def _cancel_orders(self, symbol: str, order_ids):
-        for oid in order_ids:
-            try:
-                self._delete("/fapi/v1/order", {"symbol": symbol, "orderId": oid})
-            except Exception:
-                pass
-
-    # ---------- 市價強平（給 hotkey/time-stop 用） ----------
-    def close_position_market(self, symbol: str):
-        amt = self._position_amt(symbol)
-        if abs(amt) < 1e-12:
-            return
-        side = "SELL" if amt > 0 else "BUY"
-        self._post("/fapi/v1/order", {
-            "symbol": symbol,
-            "side": side,
-            "type": "MARKET",
-            "quantity": f"{abs(amt)}",
-            "reduceOnly": "true",
-            "newClientOrderId": f"force_close_{int(time.time()*1000)}",
-        })
+    def cancel_open_orders(self, symbol: str):
         try:
-            self.cancel_open_orders(symbol)
+            self._delete("/fapi/v1/allOpenOrders", {"symbol": symbol})
+        except Exception:
+            pass  # 沒單就算了
+
+    def _ensure_oneway_and_leverage(self, symbol: str):
+        # 確保單向持倉（避免對沖模式造成 reduceOnly 行為怪異）
+        try:
+            self._post("/fapi/v1/positionSide/dual", {"dualSidePosition": "false"})
+        except Exception:
+            pass
+        # 設置槓桿（若 config 有 LEVERAGE）
+        try:
+            lev = int(LEVERAGE) if LEVERAGE else 10
+            self._post("/fapi/v1/leverage", {"symbol": symbol, "leverage": lev})
         except Exception:
             pass
 
-    # ---------- 進場 + 掛保護單（關鍵） ----------
+    # ---------------- main contract ----------------
     def place_bracket(self, symbol: str, side: str, qty_s: str, entry_s: str, sl_s: str, tp_s: str):
         """
-        僅先建立進場單（MARKET），成交後再補掛止盈 / 止損
-        - 自動檢查餘額，若金額不足則調整張數
-        - 成交後會在 _attach_brackets_if_needed() 補掛 TP/SL
+        契約：主流程呼叫一次 → 這裡做完整流程：
+        1) 取消 symbol 既有未成委託
+        2) 市價進場
+        3) 以 closePosition=true 補掛 SL/TP（MARK_PRICE）
+        4) self.open 記錄入場（只做顯示用途；真實狀態以交易所為準，靠 sync_state()）
         """
-        symbol = symbol.upper().strip()
+        load_exchange_info()
+        symbol = symbol.upper()
         if symbol not in EXCHANGE_INFO:
             raise ValueError(f"symbol not tradable or not found in exchangeInfo: {symbol}")
 
-        self._cancel_all_symbol_orders(symbol)
-        # 先清該標的舊掛單
-        try:
-            self._cancel_all_symbol_orders(symbol)
-        except Exception as e:
-            log.error(f"[ENTRY] clear old orders failed for {symbol}: {e}")
+        info = EXCHANGE_INFO[symbol]
+        price_prec = int(info.get("pricePrecision", 8))
+        qty_prec   = int(info.get("quantityPrecision", 0))
+        tick       = float(info.get("tickSize", 0.0) or 0.0)
+
+        # 對齊格子（保守向下取格）
+        sl_f = _floor_to_step(float(sl_s), tick,  price_prec)
+        tp_f = _floor_to_step(float(tp_s), tick,  price_prec)
+        qty_f = float(f"{float(qty_s):.{qty_prec}f}")
+
         side_u = side.upper()
         is_bull = (side_u == "LONG")
-        qty_f = float(qty_s)
 
-        # 取得價格與帳戶可用 USDT
-        mark_price = self.best_price(symbol)
-        balance = self.balance_usdt()
+        # 準備環境 + 清殘單
+        self._ensure_oneway_and_leverage(symbol)
+        self.cancel_open_orders(symbol)
 
-        # 檢查是否有足夠保證金（此為大略估算）
-        leverage = getattr(self, "default_leverage", 10)
-        notional = qty_f * mark_price / leverage
-        if notional > balance * 0.95:
-            qty_f = (balance * 0.9 * leverage) / mark_price
-            qty_s = f"{qty_f:.6f}"
-            log.info(f"[ENTRY] Adjust qty for {symbol} due to balance: qty={qty_s}")
-
-            qty_s = f"{qty_f:.6f}"
-            log(f"⚠️ 調整 {symbol} 張數因餘額不足 → {qty_s}", "SYS")
-
-        # 進場：直接市價單
+        # 1) 市價進場
         params_entry = {
             "symbol": symbol,
-            "side": ("BUY" if is_bull else "SELL"),
-            "type": "MARKET",
-            "quantity": qty_s,
+            "side":   ("BUY" if is_bull else "SELL"),
+            "type":   "MARKET",
+            "quantity": f"{qty_f:.{qty_prec}f}",
+            "newOrderRespType": "RESULT",
             "newClientOrderId": f"mkt_entry_{int(time.time()*1000)}",
         }
-
-        # 送出市價單
         self._post("/fapi/v1/order", params_entry)
+        log(f"MARKET ENTRY for {symbol} {side_u} qty={qty_f}", "ORDER")
 
-        # 記錄開倉資料
-        self.open = {
+        # 2) 立即補掛 reduce-only SL/TP（以 Mark Price 觸發）
+        base = {
             "symbol": symbol,
-            "side": side_u,
-            "qty": qty_f,
-            "entry": mark_price,
-            "sl": float(sl_s),
-            "tp": float(tp_s),
-            "pending": True,  # 等成交後補掛
+            "closePosition": "true",
+            "workingType": "MARK_PRICE",
+            "priceProtect": "true",
+            "newOrderRespType": "RESULT",
         }
-        log(f"✅ MARKET ENTRY SENT for {symbol} ({side_u}) qty={qty_s} price≈{mark_price}", "ORDER")
+
+        params_sl = dict(base)
+        params_sl.update({
+            "side": ("SELL" if is_bull else "BUY"),
+            "type": "STOP_MARKET",
+            "stopPrice": _fmt(sl_f, price_prec),
+            "newClientOrderId": f"sl_{int(time.time()*1000)}",
+        })
+        params_tp = dict(base)
+        params_tp.update({
+            "side": ("SELL" if is_bull else "BUY"),
+            "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": _fmt(tp_f, price_prec),
+            "newClientOrderId": f"tp_{int(time.time()*1000)}",
+        })
+        self._post("/fapi/v1/order", params_sl)
+        self._post("/fapi/v1/order", params_tp)
+        log(f"ATTACHED SL/TP for {symbol} SL={_fmt(sl_f, price_prec)} TP={_fmt(tp_f, price_prec)}", "ORDER")
+
+        # 3) 記錄顯示用狀態（面板會透過 sync_state() 校正）
+        entry_px = self._avg_entry_price(symbol)
+        self.open = {
+            "symbol": symbol, "side": side_u, "qty": qty_f,
+            "entry": entry_px or float(entry_s), "sl": sl_f, "tp": tp_f
+        }
         return "OK"
 
-
-
-    # ---------- 偵測是否已平倉 + 清殘單 + 記帳 ----------
     def poll_and_close_if_hit(self, day_guard):
+        """
+        不再用本地「價格交叉」來判 TP/SL。
+        只看「倉位是否歸零」。若歸零 → 認定已由 TP/SL（或手動）平倉，做清理與記帳。
+        """
         if not self.open:
             return False, None, None, None, None
 
         symbol = self.open["symbol"]
-        side   = self.open["side"]
-        entry  = float(self.open["entry"])
-        p      = self.best_price(symbol)
-        hit_tp = (p >= self.open["tp"]) if side == "LONG" else (p <= self.open["tp"])
-        hit_sl = (p <= self.open["sl"]) if side == "LONG" else (p >= self.open["sl"])
+        pos_sz = self._position_amt(symbol)
 
-        # 尚未命中止盈/止損 → 檢查是否該補掛
-        if not (hit_tp or hit_sl):
-            try:
-                self._attach_brackets_if_needed()
-            except Exception:
-                pass
+        if abs(pos_sz) > 1e-12:
+            # 倉位仍在 → 若 SL/TP 不存在則補掛
+            self._attach_brackets_if_needed()
             return False, None, None, None, None
 
-        # 命中 TP 或 SL → 強制平倉
-        exit_price = self.open["tp"] if hit_tp else self.open["sl"]
-        pct = (exit_price - entry) / entry
-        if side == "SHORT":
-            pct = -pct
-        reason = "TP" if hit_tp else "SL"
-
+        # 倉位已經沒了 → 視為觸發 TP 或 SL（或手動關）
+        # 嘗試判斷哪個被觸發（以當前價格接近誰為準，僅供日誌）
+        side = self.open["side"]
+        entry = float(self.open["entry"])
+        sl = float(self.open["sl"])
+        tp = float(self.open["tp"])
         try:
-            self._post("/fapi/v1/order", {
-                "symbol": symbol,
-                "side": ("SELL" if side == "LONG" else "BUY"),
-                "type": "MARKET",
-                "quantity": f"{float(self.open['qty']):.6f}",
-                "newClientOrderId": f"close_{int(time.time()*1000)}",
-            })
-        except Exception as e:
-            log.error(f"⚠️ 強制平倉失敗 {symbol}: {e}")
-
-        # 取消殘單
-        try:
-            self._cancel_all_symbol_orders(symbol)
+            p = self.best_price(symbol)
         except Exception:
-            pass
+            p = entry
 
-        log.info(f"💰 {reason} HIT for {symbol}, +{pct*100:.2f}%")
+        diff_tp = abs(p - tp)
+        diff_sl = abs(p - sl)
+        reason = "TP" if diff_tp <= diff_sl else "SL"
+        exit_price = tp if reason == "TP" else sl
+
+        pct = (exit_price - entry) / entry
+        if side == "SHORT": pct = -pct
+
+        # 清乾淨所有未成交委託（殘單）
+        self.cancel_open_orders(symbol)
+
+        # 記帳 + 清本地
         trade_data = self.open
         self.open = None
         day_guard.on_trade_close(pct)
-
         try:
             log_trade(
                 symbol=symbol,
@@ -394,19 +392,61 @@ class LiveAdapter:
         except Exception:
             pass
 
+        log(f"{reason} HIT {symbol} pnl={pct*100:.2f}%", "ORDER")
         return True, pct, symbol, reason, exit_price
 
+    def _attach_brackets_if_needed(self):
+        if not self.open:
+            return
+        symbol = self.open["symbol"]
+        side_u = self.open["side"]
+        is_bull = (side_u == "LONG")
 
-    def _cancel_all_symbol_orders(self, symbol: str):
-        """
-        取消該標的所有未成交掛單（包含止盈止損）。
-        避免越掛越多的 leftover orders。
-        """
-        try:
-            r = self._delete("/fapi/v1/allOpenOrders", {"symbol": symbol})
-            log.info(f"[CANCEL] cleared all open orders for {symbol}")
-            return r
-        except Exception as e:
-            log.error(f"[CANCEL] failed to clear open orders for {symbol}: {e}")
-            return None
+        # 若委託裡已經有 reduce-only 的條件單就不補
+        orders = self._open_orders(symbol) or []
+        has_sl = any(o.get("type") == "STOP_MARKET" and o.get("closePosition") for o in orders)
+        has_tp = any(o.get("type") == "TAKE_PROFIT_MARKET" and o.get("closePosition") for o in orders)
+        if has_sl and has_tp:
+            return
 
+        info = EXCHANGE_INFO[symbol]
+        price_prec = int(info.get("pricePrecision", 8))
+        sl_s = _fmt(float(self.open["sl"]), price_prec)
+        tp_s = _fmt(float(self.open["tp"]), price_prec)
+
+        base = {
+            "symbol": symbol,
+            "closePosition": "true",
+            "workingType": "MARK_PRICE",
+            "priceProtect": "true",
+            "newOrderRespType": "RESULT",
+        }
+        if not has_sl:
+            self._post("/fapi/v1/order", {
+                **base,
+                "side": ("SELL" if is_bull else "BUY"),
+                "type": "STOP_MARKET",
+                "stopPrice": sl_s,
+                "newClientOrderId": f"sl_{int(time.time()*1000)}",
+            })
+        if not has_tp:
+            self._post("/fapi/v1/order", {
+                **base,
+                "side": ("SELL" if is_bull else "BUY"),
+                "type": "TAKE_PROFIT_MARKET",
+                "stopPrice": tp_s,
+                "newClientOrderId": f"tp_{int(time.time()*1000)}",
+            })
+
+    # 讓面板對齊交易所真實狀態：若本地有 open，但交易所倉位已 0，則清理；反之更新 entry/qty
+    def sync_state(self):
+        if not self.open:
+            return
+        symbol = self.open["symbol"]
+        amt = self._position_amt(symbol)
+        if abs(amt) < 1e-12:
+            self.open = None
+            return
+        # 更新面板用欄位
+        self.open["entry"] = self._avg_entry_price(symbol) or self.open["entry"]
+        self.open["qty"] = abs(amt)

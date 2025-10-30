@@ -96,3 +96,4 @@ MAKER_ENTRY = True           # 先以 maker 進場
 TAKER_EXIT = True            # 允許以市價快速離場
 SLIPPAGE_CAP_PCT = 0.0007    # 市價/可成交限價最大滑點 7 bps
 MAX_OPEN_POSITIONS = 1       # 建議同時僅持 1 檔（降干擾）
+LEVERAGE = 10  # 你要的預設槓桿
