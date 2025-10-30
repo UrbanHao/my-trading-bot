@@ -24,13 +24,18 @@ from utils import (
 )
 from signals.signal_scalp_breakout import scalp_breakout_signal
 from signals.signal_scalp_vwap import scalp_vwap_signal
+import logging
+logger = logging.getLogger("bot")
 load_exchange_info(force_refresh=True)
 
 def state_iter():
     # hotkeys local imports (ensure available even if top-level imports failed)
     import sys, threading, termios, tty, select  # hotkeys
     from datetime import datetime
-
+    # 這段放在 state_iter() 內，取代原本的 ui_log() 函式
+    def ui_ui_log(msg, tag="SYS"):
+        ts = datetime.now().strftime("%H:%M:%S")
+        events.append((ts, f"{tag}: {msg}"))
     # === 讀取 Scalp 設定（不改 config.py 也能用環境變數覆蓋） ===
     SCALP_MODE = (os.getenv("SCALP_MODE") or getattr(config, "SCALP_MODE", "") or "").lower()  # "", "breakout", "vwap"
     TIME_STOP_SEC = int(os.getenv("TIME_STOP_SEC", str(getattr(config, "TIME_STOP_SEC", 180))))  # 預設 180 秒
@@ -72,7 +77,7 @@ def state_iter():
     cooldown = {"until": 0.0, "symbol_lock": {}}
     open_ts = None  # 開倉時間（for time-stop）
 
-    def log(msg, tag="SYS"):
+    def ui_log(msg, tag="SYS"):
         ts = datetime.now().strftime("%H:%M:%S")
         events.append((ts, f"{tag}: {msg}"))
 
@@ -88,7 +93,7 @@ def state_iter():
                     ch = sys.stdin.read(1)
                     if ch == "p":
                         paused["scan"] = not paused["scan"]
-                        log(f"toggle pause -> {paused['scan']}", "KEY")
+                        ui_log(f"toggle pause -> {paused['scan']}", "KEY")
                     elif ch == "x":
                         if adapter.has_open():
                             try:
@@ -100,14 +105,14 @@ def state_iter():
                                 log_trade(sym, side, adapter.open.get("qty", 0), entry, nowp, pct, "hotkey_x")
                                 day.on_trade_close(pct)
                                 adapter.open = None
-                                log("force close position", "KEY")
+                                ui_log("force close position", "KEY")
                             except Exception as e:
-                                log(f"close error: {e}", "KEY")
+                                ui_log(f"close error: {e}", "KEY")
                         else:
-                            log("no position to close", "KEY")
+                            ui_log("no position to close", "KEY")
                     elif ch == "!":
                         day.state.halted = True
-                        log("manual HALT for today", "KEY")
+                        ui_log("manual HALT for today", "KEY")
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
@@ -122,9 +127,9 @@ def state_iter():
         if t_now - last_time_sync > 1800:
             try:
                 new_offset = update_time_offset()
-                log(f"Time offset re-synced: {new_offset} ms", "SYS")
+                ui_log(f"Time offset re-synced: {new_offset} ms", "SYS")
             except Exception as e:
-                log(f"Time offset sync failed: {e}", "ERROR")
+                ui_log(f"Time offset sync failed: {e}", "ERROR")
             finally:
                 last_time_sync = t_now
 
@@ -137,11 +142,11 @@ def state_iter():
             try:
                 closed, pct, sym, reason, exit_price = adapter.poll_and_close_if_hit(day)
             except Exception as e:
-                log(f"poll error: {e}")
+                ui_log(f"poll error: {e}")
                 closed, pct, sym, reason, exit_price = (False, None, None, None, None)
 
             if closed:
-                log(f"CLOSE {sym} ({reason}) pct={pct*100:.2f}% day={day.state.pnl_pct*100:.2f}%")
+                ui_log(f"CLOSE {sym} ({reason}) pct={pct*100:.2f}% day={day.state.pnl_pct*100:.2f}%")
                 # 記帳
                 try:
                     log_trade(
@@ -154,7 +159,7 @@ def state_iter():
                         reason=reason
                     )
                 except Exception as e:
-                    log(f"Journal log_trade failed: {e}", "ERROR")
+                    ui_log(f"Journal log_trade failed: {e}", "ERROR")
 
                 cooldown["until"] = time.time() + COOLDOWN_SEC
                 last_bal_ts = 0.0
@@ -165,11 +170,11 @@ def state_iter():
                     if USE_LIVE:
                         equity = adapter.balance_usdt()
                         account["balance"] = equity
-                        log(f"Balance updated: {equity:.2f}", "SYS")
+                        ui_log(f"Balance updated: {equity:.2f}", "SYS")
                     else:
                         equity = start_equity * (1.0 + day.state.pnl_pct)
                 except Exception as e:
-                    log(f"Balance update failed: {e}", "SYS")
+                    ui_log(f"Balance update failed: {e}", "SYS")
                     equity = start_equity * (1.0 + day.state.pnl_pct)
 
                 position_view = None
@@ -186,7 +191,7 @@ def state_iter():
                         log_trade(sym, side, adapter.open.get("qty", 0), entry, nowp, pct, "time-stop")
                         day.on_trade_close(pct)
                         adapter.open = None
-                        log(f"time-stop close {sym}", "SYS")
+                        ui_log(f"time-stop close {sym}", "SYS")
                         cooldown["until"] = time.time() + COOLDOWN_SEC
                         open_ts = None
 
@@ -200,7 +205,7 @@ def state_iter():
                         else:
                             equity = start_equity * (1.0 + day.state.pnl_pct)
                     except Exception as e:
-                        log(f"time-stop error: {e}", "ERROR")
+                        ui_log(f"time-stop error: {e}", "ERROR")
 
         # ========== 2) 無持倉：掃描與找入場 ==========
         else:
@@ -212,14 +217,14 @@ def state_iter():
                     if ENABLE_LONG:
                         top10 = fetch_top_gainers(10)          # 面板顯示照舊
                         ws_syms.extend([t[0] for t in top10])
-                        log("top10_gainers ok", "SCAN")
+                        ui_log("top10_gainers ok", "SCAN")
                     else:
                         top10 = []
 
                     if ENABLE_SHORT:
                         top10_losers = fetch_top_losers(10)    # 面板顯示照舊
                         ws_syms.extend([t[0] for t in top10_losers])
-                        log("top10_losers ok", "SCAN")
+                        ui_log("top10_losers ok", "SCAN")
                     else:
                         top10_losers = []
 
@@ -282,7 +287,7 @@ def state_iter():
                         start_ws(list(set(ws_syms)), USE_TESTNET)
 
                 except Exception as e:
-                    log(f"scan error: {e}", "SCAN")
+                    ui_log(f"scan error: {e}", "SCAN")
                     candidate = None
 
 
@@ -292,11 +297,11 @@ def state_iter():
 
                     # 若已有相同 symbol 的倉位，略過（防止重複開倉）
                     if adapter.has_open() and adapter.open and adapter.open.get("symbol") == symbol:
-                        log(f"Skipping {symbol}: already has open position", "SYS")
+                        ui_log(f"Skipping {symbol}: already has open position", "SYS")
                         continue
 
                     if not is_futures_symbol(symbol):
-                        log(f"Skipping {symbol}: not in futures exchangeInfo", "SCAN")
+                        ui_log(f"Skipping {symbol}: not in futures exchangeInfo", "SCAN")
                         cooldown["symbol_lock"][symbol] = time.time() + 60
                         continue
 
@@ -309,7 +314,7 @@ def state_iter():
                         sl_f,    _,     _,          _        = conform_to_filters(symbol, sl_raw, qty_raw)
                         tp_f,    _,     _,          _        = conform_to_filters(symbol, tp_raw, qty_raw)
                     except Exception as e:
-                        log(f"Filter/Conform error for {symbol}: {e}", "ERR")
+                        ui_log(f"Filter/Conform error for {symbol}: {e}", "ERR")
                         candidate = None
 
                     if candidate and qty_f > 0.0:
@@ -330,7 +335,7 @@ def state_iter():
                                 "symbol": symbol, "side": side, "qty": qty_f,
                                 "entry": adapter.open["entry"], "sl": sl_f, "tp": tp_f
                             }
-                            log(f"OPEN {symbol} qty={qty_f} entry≈{position_view['entry']:.6f} | {reason}", "ORDER")
+                            ui_log(f"OPEN {symbol} qty={qty_f} entry≈{position_view['entry']:.6f} | {reason}", "ORDER")
 
                             cooldown["until"] = time.time() + COOLDOWN_SEC
                             cooldown["symbol_lock"][symbol] = time.time() + REENTRY_BLOCK_SEC
@@ -340,15 +345,15 @@ def state_iter():
                                 server_msg = e.response.json()
                                 code = server_msg.get("code")
                                 msg  = server_msg.get("msg")
-                                log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
-                                log(f"SERVER MSG: {msg} (Code: {code})", "ERROR")
+                                ui_log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
+                                ui_log(f"SERVER MSG: {msg} (Code: {code})", "ERROR")
                             except Exception:
-                                log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
-                                log(f"SERVER MSG: {e.response.text}", "ERROR")
+                                ui_log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
+                                ui_log(f"SERVER MSG: {e.response.text}", "ERROR")
                         except Exception as e:
-                            log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
+                            ui_log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
                     else:
-                        log(f"Skipping {symbol}, qty==0 (Notional={notional:.2f})", "SYS")
+                        ui_log(f"Skipping {symbol}, qty==0 (Notional={notional:.2f})", "SYS")
 
 
         # 3) 更新顯示用 Equity
