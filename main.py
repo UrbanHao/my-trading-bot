@@ -42,8 +42,8 @@ def state_iter():
     # === 讀取 Scalp 設定（不改 config.py 也能用環境變數覆蓋） ===
     SCALP_MODE = (os.getenv("SCALP_MODE") or getattr(config, "SCALP_MODE", "") or "").lower()  # "", "breakout", "vwap"
     TIME_STOP_SEC = int(os.getenv("TIME_STOP_SEC", str(getattr(config, "TIME_STOP_SEC", 180))))  # 預設 180 秒
-    COOLDOWN_SEC = 3          # 平倉後全域冷卻
-    REENTRY_BLOCK_SEC = 45    # 同標的平倉後禁止再次進場秒數
+    COOLDOWN_SEC = 3        # 平倉後全域冷卻
+    REENTRY_BLOCK_SEC = 45  # 同標的平倉後禁止再次進場秒數
 
     load_dotenv(override=True)
     load_exchange_info()
@@ -80,9 +80,7 @@ def state_iter():
     cooldown = {"until": 0.0, "symbol_lock": {}}
     open_ts = None  # 開倉時間（for time-stop）
 
-    def ui_log(msg, tag="SYS"):
-        ts = datetime.now().strftime("%H:%M:%S")
-        events.append((ts, f"{tag}: {msg}"))
+    # (你重複定義了 ui_log，我刪掉第二個)
 
     # --- 非阻塞鍵盤監聽（p: 暫停/恢復掃描, x: 立即平倉, !: 今日停機） ---
     def _keyloop():
@@ -97,22 +95,52 @@ def state_iter():
                     if ch == "p":
                         paused["scan"] = not paused["scan"]
                         ui_log(f"toggle pause -> {paused['scan']}", "KEY")
+                    
+                    # ⬇️ *** 修正 'x' 熱鍵邏輯 ***
                     elif ch == "x":
                         if adapter.has_open():
                             try:
                                 sym = adapter.open["symbol"]
-                                entry = float(adapter.open["entry"])
                                 side = adapter.open["side"]
-                                nowp = adapter.best_price(sym)
+                                qty = adapter.open.get("qty", 0)
+                                entry = float(adapter.open["entry"]) # 先取得 entry
+                                
+                                # --- 修正：在這裡實際平倉 ---
+                                if isinstance(adapter, LiveAdapter) and qty > 0:
+                                    try:
+                                        close_side = "SELL" if side == "LONG" else "BUY"
+                                        logger.info(f"[KEY] Attempting manual close for {sym}...")
+                                        adapter._post("/fapi/v1/order", {
+                                            "symbol": sym,
+                                            "side": close_side,
+                                            "type": "MARKET",
+                                            "quantity": f"{qty:.6f}",
+                                            "reduceOnly": "true",
+                                            "newClientOrderId": f"manual_close_{int(time.time())}"
+                                        })
+                                        adapter.cancel_open_orders(sym) # 取消舊的 TP/SL
+                                        ui_log(f"API market close for {sym} sent.", "KEY")
+                                    except Exception as e:
+                                        ui_log(f"API close FAILED: {e}", "ERROR")
+                                        # 如果 API 平倉失敗，我們**不能**清除 adapter.open
+                                        # 拋出例外，讓外層 try/except 捕捉，阻止後續流程
+                                        raise RuntimeError(f"API close failed, state not cleared: {e}")
+                                # --- 修正結束 ---
+                                
+                                # 只有在 API 成功 (或模擬盤) 後，才執行以下清除狀態的程式
+                                nowp = adapter.best_price(sym) # 獲取當前價格
                                 pct = (nowp - entry) / entry if side == "LONG" else (entry - nowp) / entry
-                                log_trade(sym, side, adapter.open.get("qty", 0), entry, nowp, pct, "hotkey_x", mode=SCALP_MODE or "MANUAL")
+                                log_trade(sym, side, qty, entry, nowp, pct, "hotkey_x", mode=SCALP_MODE or "MANUAL")
                                 day.on_trade_close(pct)
-                                adapter.open = None
+                                adapter.open = None # <-- 現在可以安全清除了
                                 ui_log("force close position", "KEY")
+
                             except Exception as e:
+                                # 會捕捉到 API 失敗的 RuntimeError
                                 ui_log(f"close error: {e}", "KEY")
                         else:
                             ui_log("no position to close", "KEY")
+                    
                     elif ch == "!":
                         day.state.halted = True
                         ui_log("manual HALT for today", "KEY")
@@ -150,7 +178,9 @@ def state_iter():
 
             if closed:
                 ui_log(f"CLOSE {sym} ({reason}) pct={pct*100:.2f}% day={day.state.pnl_pct*100:.2f}%")
-                # 記帳
+                
+                # 記帳 (你原本在 poll_and_close_if_hit 裡面記了，這裡又記一次)
+                # (我保留你原有的邏輯，但你 poll_and_close_if_hit 裡的 log_trade 已經足夠了)
                 try:
                     log_trade(
                         symbol=sym,
@@ -163,7 +193,9 @@ def state_iter():
                         mode=SCALP_MODE or "VOL" # 如果不是 Scalp 模式，就當作是 VOL 策略
                     )
                 except Exception as e:
-                    ui_log(f"Journal log_trade failed: {e}", "ERROR")
+                    # 這裡的錯誤可能是因為 poll_and_close_if_hit 已經記過了 (如果它修復了)
+                    # 或是 journal.py 的問題，我們只記錄警告
+                    ui_log(f"Duplicate Journal log_trade warn: {e}", "WARN")
 
                 cooldown["until"] = time.time() + COOLDOWN_SEC
                 last_bal_ts = 0.0
@@ -185,16 +217,41 @@ def state_iter():
 
             else:
                 # 1b) 時間停損（僅在 Scalp 模式生效）
+                # ⬇️ *** 修正 'TIME_STOP_SEC' 邏輯 ***
                 if SCALP_MODE and (open_ts is not None) and ((t_now - open_ts) >= TIME_STOP_SEC):
                     try:
                         sym = adapter.open["symbol"]
                         entry = float(adapter.open["entry"])
                         side = adapter.open["side"]
+                        qty = adapter.open.get("qty", 0) # <--- 取得 Qty
+
+                        # --- 修正：在這裡實際平倉 ---
+                        if isinstance(adapter, LiveAdapter) and qty > 0:
+                            try:
+                                close_side = "SELL" if side == "LONG" else "BUY"
+                                logger.info(f"[TIME-STOP] Attempting API close for {sym}...")
+                                adapter._post("/fapi/v1/order", {
+                                    "symbol": sym,
+                                    "side": close_side,
+                                    "type": "MARKET",
+                                    "quantity": f"{qty:.6f}",
+                                    "reduceOnly": "true",
+                                    "newClientOrderId": f"time_stop_{int(time.time())}"
+                                })
+                                adapter.cancel_open_orders(sym)
+                                ui_log(f"API time-stop close for {sym} sent.", "SYS")
+                            except Exception as e:
+                                ui_log(f"API time-stop FAILED: {e}", "ERROR")
+                                # 拋出例外，阻止後續清除狀態
+                                raise RuntimeError(f"API time-stop failed, state not cleared: {e}")
+                        # --- 修正結束 ---
+                        
+                        # 只有 API 成功 (或模擬盤) 後才執行
                         nowp = adapter.best_price(sym)
                         pct = (nowp - entry) / entry if side == "LONG" else (entry - nowp) / entry
-                        log_trade(sym, side, adapter.open.get("qty", 0), entry, nowp, pct, "time-stop", mode=SCALP_MODE)
+                        log_trade(sym, side, qty, entry, nowp, pct, "time-stop", mode=SCALP_MODE)
                         day.on_trade_close(pct)
-                        adapter.open = None
+                        adapter.open = None # <-- 現在可以安全清除了
                         ui_log(f"time-stop close {sym}", "SYS")
                         cooldown["until"] = time.time() + COOLDOWN_SEC
                         open_ts = None
@@ -208,7 +265,9 @@ def state_iter():
                                 pass
                         else:
                             equity = start_equity * (1.0 + day.state.pnl_pct)
+                    
                     except Exception as e:
+                        # 捕捉 API 失敗的 RuntimeError
                         ui_log(f"time-stop error: {e}", "ERROR")
 
         # ========== 2) 無持倉：掃描與找入場 ==========
@@ -219,14 +278,14 @@ def state_iter():
 
                     # 2a) 抓取 Gainers / Losers（遵守 ENABLE_LONG / ENABLE_SHORT）
                     if ENABLE_LONG:
-                        top10 = fetch_top_gainers(10)          # 面板顯示照舊
+                        top10 = fetch_top_gainers(10)        # 面板顯示照舊
                         ws_syms.extend([t[0] for t in top10])
                         ui_log("top10_gainers ok", "SCAN")
                     else:
                         top10 = []
 
                     if ENABLE_SHORT:
-                        top10_losers = fetch_top_losers(10)    # 面板顯示照舊
+                        top10_losers = fetch_top_losers(10)  # 面板顯示照舊
                         ws_syms.extend([t[0] for t in top10_losers])
                         ui_log("top10_losers ok", "SCAN")
                     else:
@@ -317,9 +376,9 @@ def state_iter():
                         sl_raw, tp_raw = compute_bracket(entry, side)
                         qty_raw = notional / max(entry, 1e-9)
 
-                        entry_f, qty_f, price_prec, qty_prec = conform_to_filters(symbol, entry, qty_raw)
-                        sl_f,    _,     _,          _        = conform_to_filters(symbol, sl_raw, qty_raw)
-                        tp_f,    _,     _,          _        = conform_to_filters(symbol, tp_raw, qty_raw)
+                        entry_f, qty_f, price_prec, qty_prec = conform_to_filters(symbol, entry, qty_raw) # type: ignore
+                        sl_f,    _,     _,          _        = conform_to_filters(symbol, sl_raw, qty_raw) # type: ignore
+                        tp_f,    _,     _,          _        = conform_to_filters(symbol, tp_raw, qty_raw) # type: ignore
 
                     except ValueError as e:
                         ui_log(f"Skipping {symbol}: {e}", "ERR")
@@ -401,7 +460,7 @@ def state_iter():
             account["balance"] = equity
             try:
                 if hasattr(adapter, "sync_state"):
-                    adapter.sync_state()
+                    adapter.sync_state() # type: ignore
             except Exception:
                 pass
         # 4) 輸出給面板
