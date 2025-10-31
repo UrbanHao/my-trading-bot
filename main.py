@@ -6,7 +6,10 @@ import time, os ,config
 from dotenv import load_dotenv
 
 from config import (USE_WEBSOCKET, USE_TESTNET, USE_LIVE, SCAN_INTERVAL_S, DAILY_TARGET_PCT, DAILY_LOSS_CAP,
-                    PER_TRADE_RISK, ENABLE_LONG, ENABLE_SHORT) # <-- 在最後加上
+                    PER_TRADE_RISK, ENABLE_LONG, ENABLE_SHORT,
+                    SCALP_MODE, MAKER_ENTRY) # <-- 在最後加上
+                    
+                    
 from utils import (fetch_top_gainers,fetch_top_losers, SESSION, load_exchange_info,EXCHANGE_INFO, update_time_offset, conform_to_filters)
 from risk_frame import DayGuard, position_size_notional, compute_bracket, PositionClock
 from adapters import SimAdapter, LiveAdapter
@@ -33,7 +36,7 @@ def state_iter():
     import sys, threading, termios, tty, select  # hotkeys
     from datetime import datetime
     # 這段放在 state_iter() 內，取代原本的 ui_log() 函式
-    def ui_ui_log(msg, tag="SYS"):
+    def ui_log(msg, tag="SYS"):
         ts = datetime.now().strftime("%H:%M:%S")
         events.append((ts, f"{tag}: {msg}"))
     # === 讀取 Scalp 設定（不改 config.py 也能用環境變數覆蓋） ===
@@ -102,7 +105,7 @@ def state_iter():
                                 side = adapter.open["side"]
                                 nowp = adapter.best_price(sym)
                                 pct = (nowp - entry) / entry if side == "LONG" else (entry - nowp) / entry
-                                log_trade(sym, side, adapter.open.get("qty", 0), entry, nowp, pct, "hotkey_x")
+                                log_trade(sym, side, adapter.open.get("qty", 0), entry, nowp, pct, "hotkey_x", mode=SCALP_MODE or "MANUAL")
                                 day.on_trade_close(pct)
                                 adapter.open = None
                                 ui_log("force close position", "KEY")
@@ -156,7 +159,8 @@ def state_iter():
                         entry=trade_data_copy["entry"],
                         exit_price=exit_price,
                         ret_pct=pct,
-                        reason=reason
+                        reason=reason,
+                        mode=SCALP_MODE or "VOL" # 如果不是 Scalp 模式，就當作是 VOL 策略
                     )
                 except Exception as e:
                     ui_log(f"Journal log_trade failed: {e}", "ERROR")
@@ -188,7 +192,7 @@ def state_iter():
                         side = adapter.open["side"]
                         nowp = adapter.best_price(sym)
                         pct = (nowp - entry) / entry if side == "LONG" else (entry - nowp) / entry
-                        log_trade(sym, side, adapter.open.get("qty", 0), entry, nowp, pct, "time-stop")
+                        log_trade(sym, side, adapter.open.get("qty", 0), entry, nowp, pct, "time-stop", mode=SCALP_MODE)
                         day.on_trade_close(pct)
                         adapter.open = None
                         ui_log(f"time-stop close {sym}", "SYS")
@@ -291,70 +295,105 @@ def state_iter():
                     candidate = None
 
 
-                # 2d) 執行下單（使用 LiveAdapter 一次性完成：市價進場 + 掛 TP/SL）
+                # 2d) 執行下單（共用原本下單流程與風控）
                 if candidate:
                     symbol, entry = candidate
 
-                    # 若已有相同 symbol 的倉位，略過（防止重複開倉）
+                    # 避免重複下單同一標的（面板與實際倉位不同步時，不要再打同一標的）
                     if adapter.has_open() and adapter.open and adapter.open.get("symbol") == symbol:
-                        ui_log(f"Skipping {symbol}: already has open position", "SYS")
+                        ui_log(f"Skipping {symbol}: already have open position", "SYS")
                         continue
 
+                    # 僅允許交易所期貨清單內的符號
                     if not is_futures_symbol(symbol):
                         ui_log(f"Skipping {symbol}: not in futures exchangeInfo", "SCAN")
                         cooldown["symbol_lock"][symbol] = time.time() + 60
                         continue
 
                     notional = position_size_notional(equity)
+
                     try:
+                        # 計算 TP/SL、對齊交易所規則
                         sl_raw, tp_raw = compute_bracket(entry, side)
                         qty_raw = notional / max(entry, 1e-9)
 
                         entry_f, qty_f, price_prec, qty_prec = conform_to_filters(symbol, entry, qty_raw)
                         sl_f,    _,     _,          _        = conform_to_filters(symbol, sl_raw, qty_raw)
                         tp_f,    _,     _,          _        = conform_to_filters(symbol, tp_raw, qty_raw)
+
+                    except ValueError as e:
+                        ui_log(f"Skipping {symbol}: {e}", "ERR")
+                        cooldown["symbol_lock"][symbol] = time.time() + 60
+                        candidate = None
                     except Exception as e:
                         ui_log(f"Filter/Conform error for {symbol}: {e}", "ERR")
                         candidate = None
 
-                    if candidate and qty_f > 0.0:
-                        entry_s = f"{entry_f:.{price_prec}f}"  # 僅作顯示，不再作條件單觸發
-                        qty_s   = f"{qty_f:.{qty_prec}f}"
-                        sl_s    = f"{sl_f:.{price_prec}f}"
-                        tp_s    = f"{tp_f:.{price_prec}f}"
+                    if candidate:
+                        if qty_f == 0.0:
+                            ui_log(f"Skipping {symbol}, calculated qty is zero (Notional={notional:.2f})", "SYS")
+                        else:
+                            entry_s = f"{entry_f:.{price_prec}f}"
+                            qty_s   = f"{qty_f:.{qty_prec}f}"
+                            sl_s    = f"{sl_f:.{price_prec}f}"
+                            tp_s    = f"{tp_f:.{price_prec}f}"
 
-                        try:
-                            cooldown["symbol_lock"][symbol] = time.time() + 5
-                            # 入場前清殘單 → 市價進場 → 補掛 SL/TP（都在 adapter 內處理）
-                            if hasattr(adapter, "cancel_open_orders"):
-                                adapter.cancel_open_orders(symbol)
-                            adapter.place_bracket(symbol, side, qty_s, entry_s, sl_s, tp_s)
-
-                            # 面板顯示
-                            position_view = {
-                                "symbol": symbol, "side": side, "qty": qty_f,
-                                "entry": adapter.open["entry"], "sl": sl_f, "tp": tp_f
-                            }
-                            ui_log(f"OPEN {symbol} qty={qty_f} entry≈{position_view['entry']:.6f} | {reason}", "ORDER")
-
-                            cooldown["until"] = time.time() + COOLDOWN_SEC
-                            cooldown["symbol_lock"][symbol] = time.time() + REENTRY_BLOCK_SEC
-                            open_ts = time.time()
-                        except requests.exceptions.HTTPError as e:
                             try:
-                                server_msg = e.response.json()
-                                code = server_msg.get("code")
-                                msg  = server_msg.get("msg")
-                                ui_log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
-                                ui_log(f"SERVER MSG: {msg} (Code: {code})", "ERROR")
-                            except Exception:
-                                ui_log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
-                                ui_log(f"SERVER MSG: {e.response.text}", "ERROR")
-                        except Exception as e:
-                            ui_log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
-                    else:
-                        ui_log(f"Skipping {symbol}, qty==0 (Notional={notional:.2f})", "SYS")
+                                # 先鎖一下，避免同一秒重複打單
+                                cooldown["symbol_lock"][symbol] = time.time() + 10
 
+                                # 入場前，先清乾淨舊掛單（避免越掛越多）
+                                try:
+                                    if hasattr(adapter, "cancel_open_orders"):
+                                        adapter.cancel_open_orders(symbol)
+                                except Exception as e:
+                                    logger.warning(f"cancel_open_orders warn: {e}")
+
+                                # 一次性流程（在 adapter 內）：市價進場 + 掛 reduceOnly 的 TP/SL
+                                # === [修改] 執行下單路由 ===
+                                if SCALP_MODE and MAKER_ENTRY:
+                                    # 1. Scalp 模式 + 啟用 Maker：
+                                    #    呼叫新的智慧下單 (Maker->Taker)，此函式會回報真實成交價
+                                    adapter.place_scalp_bracket(symbol, side, qty_s, entry_s, sl_s, tp_s)
+                                    # 狀態由 adapter 內部設定，但我們需要更新面板
+                                    # (adapter.open 內有真實成交價，但為求即時顯示，先用 entry_f)
+                                    position_view = {"symbol": symbol, "side": side, "qty": qty_f,
+                                                     "entry": entry_f, "sl": sl_f, "tp": tp_f}
+                                    ui_log(f"OPEN (SCALP) {symbol} qty={qty_f} ref_entry={entry_f:.6f} | {reason}", "ORDER")
+
+                                else:
+                                    # 2. 舊策略 (VOL) 或 Scalp (Taker 模式)：
+                                    #    呼叫原本的純市價下單
+                                    adapter.place_bracket(symbol, side, qty_s, entry_s, sl_s, tp_s)
+
+                                    position_view = {"symbol": symbol, "side": side, "qty": qty_f,
+                                                     "entry": entry_f, "sl": sl_f, "tp": tp_f}
+                                    ui_log(f"OPEN ({SCALP_MODE or 'VOL'}) {symbol} qty={qty_f} entry={entry_f:.6f} | {reason}", "ORDER")
+
+                                # (刪除你原本的 ui_log)
+                                # 冷卻與重入鎖
+                                cooldown["until"] = time.time() + COOLDOWN_SEC
+                                cooldown["symbol_lock"][symbol] = time.time() + REENTRY_BLOCK_SEC
+                                open_ts = time.time()
+
+                            except requests.exceptions.HTTPError as e:
+                                try:
+                                    server_msg = e.response.json()
+                                    code = server_msg.get("code")
+                                    msg = server_msg.get("msg")
+                                    ui_log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
+                                    ui_log(f"SERVER MSG: {msg} (Code: {code})", "ERROR")
+                                    logger.error(f"order http error {symbol}: {code} {msg}")
+                                    # 立即觸發之類 -2021，可延長鎖
+                                    if code == -2021:
+                                        cooldown["symbol_lock"][symbol] = time.time() + 180
+                                except Exception:
+                                    ui_log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
+                                    ui_log(f"SERVER MSG: {e.response.text}", "ERROR")
+                                    logger.error(f"order http error raw {symbol}: {e.response.text}")
+                            except Exception as e:
+                                ui_log(f"ORDER FAILED for {symbol}: {e}", "ERROR")
+                                logger.error(f"order failed {symbol}: {e}")
 
         # 3) 更新顯示用 Equity
         account["equity"] = equity

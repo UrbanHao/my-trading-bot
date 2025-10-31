@@ -8,7 +8,7 @@ def _ensure_file():
         with open(PATH, "w", newline="") as f:
             csv.writer(f).writerow(HEAD)
 
-def log_trade(symbol:str, side:str, qty:float, entry:float, exit_price:float, ret_pct:float, reason:str):
+def log_trade(symbol:str, side:str, qty:float, entry:float, exit_price:float, ret_pct:float, reason:str,mode=None):
     _ensure_file()
     with open(PATH, "a", newline="") as f:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
