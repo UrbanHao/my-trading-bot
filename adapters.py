@@ -518,69 +518,85 @@ class LiveAdapter:
     # (你檔案中在 class 外面的 get_mark_price 已經被我移到 class 內部了)
 
     def place_scalp_bracket(self, symbol: str, side: str, qty_s: str, entry_s: str, sl_s: str, tp_s: str, maker_timeout_ms=1500):
-            """
-            [新增] Scalp 專用：Maker-Taker 智慧下單 + 掛載 TP/SL
-            1. 嘗試 Maker (Post-Only) 限價單
-            2. 等待 X 毫秒
-            3. 若未成交，取消 Maker 單，改下 Taker (Market) 單
-            4. 掛載 TP/SL
-            """
-            if self._placing:
-                raise RuntimeError("placing in progress")
-            self._placing = True
+                """
+                [新增] Scalp 專用：Maker-Taker 智慧下單 + 掛載 TP/SL
+                1. 嘗試 Maker (Post-Only) 限價單
+                2. 等待 X 毫秒
+                3. 若未成交，取消 Maker 單，改下 Taker (Market) 單
+                4. 掛載 TP/SL
+                """
+                if self._placing:
+                    raise RuntimeError("placing in progress")
+                self._placing = True
 
-            symbol = symbol.upper().strip()
-            side_u = side.upper()
-            is_bull = (side_u == "LONG")
-            qty = float(qty_s)
-            sl_f = float(sl_s)
-            tp_f = float(tp_s)
-            entry_f = float(entry_s) # 參考價格
-            
-            avg_filled_price = None
-            order_id = None
+                symbol = symbol.upper().strip()
+                side_u = side.upper()
+                is_bull = (side_u == "LONG")
+                qty = float(qty_s)
+                sl_f = float(sl_s)
+                tp_f = float(tp_s)
+                entry_f = float(entry_s) # 參考價格
+                
+                avg_filled_price = None
+                order_id = None
 
-            try:
-                # 1) 清殘單
-                self.cancel_open_orders(symbol)
-
-                # === 步驟 1: 嘗試 Maker (Post-Only) ===
                 try:
-                    params_maker = {
-                        "symbol": symbol,
-                        "side": ("BUY" if is_bull else "SELL"),
-                        "type": "LIMIT",
-                        "quantity": qty_s,
-                        "price": entry_s, # 使用訊號參考價
-                        "timeInForce": "GTX", # (Post-Only)
-                        "newOrderRespType": "RESULT",
-                        "newClientOrderId": f"maker_entry_{now_ts_ms()}",
-                    }
-                    maker_resp = self._post("/fapi/v1/order", params_maker)
-                    order_id = maker_resp.get("orderId")
-                    logger.info(f"[ENTRY] MAKER {symbol} {side_u} qty={qty_s} @ {entry_s} (ID: {order_id})")
+                    # 1) 清殘單
+                    self.cancel_open_orders(symbol)
 
-                    # === 步驟 2: 等待 Maker 單成交 ===
-                    time.sleep(maker_timeout_ms / 1000.0) # 等待 1.5 秒
-                    
-                    status_resp = self._get_order(symbol, order_id)
-                    status = status_resp.get("status") if status_resp else "UNKNOWN"
+                    # === 步驟 1: 嘗試 Maker (Post-Only) ===
+                    try:
+                        params_maker = {
+                            "symbol": symbol,
+                            "side": ("BUY" if is_bull else "SELL"),
+                            "type": "LIMIT",
+                            "quantity": qty_s,
+                            "price": entry_s, # 使用訊號參考價
+                            "timeInForce": "GTX", # (Post-Only)
+                            "newOrderRespType": "RESULT",
+                            "newClientOrderId": f"maker_entry_{now_ts_ms()}",
+                        }
+                        maker_resp = self._post("/fapi/v1/order", params_maker)
+                        order_id = maker_resp.get("orderId")
+                        logger.info(f"[ENTRY] MAKER {symbol} {side_u} qty={qty_s} @ {entry_s} (ID: {order_id})")
 
-                    if status == "FILLED":
-                        logger.info(f"[ENTRY] MAKER order {order_id} FILLED.")
-                        avg_filled_price = float(status_resp.get("avgPrice", entry_f))
-                    
-                    else:
-                        # === 步驟 3: Maker 未成，取消並改 Taker ===
-                        logger.warning(f"[ENTRY] MAKER {order_id} status={status}. Cancelling and switching to TAKER.")
-                        self._cancel_order(symbol, order_id) # 嘗試取消
+                        # === 步驟 2: 等待 Maker 單成交 ===
+                        time.sleep(maker_timeout_ms / 1000.0) # 等待 1.5 秒
                         
-                        # 檢查滑點保護
-                        current_price = self.best_price(symbol)
-                        slip_pct = abs(current_price - entry_f) / entry_f
-                        if slip_pct > config.SLIPPAGE_CAP_PCT: # type: ignore
-                            raise RuntimeError(f"Slippage too large on taker fallback ({slip_pct*100:.2f}%)")
+                        status_resp = self._get_order(symbol, order_id)
+                        status = status_resp.get("status") if status_resp else "UNKNOWN"
 
+                        if status == "FILLED":
+                            logger.info(f"[ENTRY] MAKER order {order_id} FILLED.")
+                            avg_filled_price = float(status_resp.get("avgPrice", entry_f))
+                        
+                        else:
+                            # === 步驟 3: Maker 未成，取消並改 Taker ===
+                            logger.warning(f"[ENTRY] MAKER {order_id} status={status}. Cancelling and switching to TAKER.")
+                            self._cancel_order(symbol, order_id) # 嘗試取消
+                            
+                            # 檢查滑點保護
+                            current_price = self.best_price(symbol)
+                            slip_pct = abs(current_price - entry_f) / entry_f
+                            if slip_pct > config.SLIPPAGE_CAP_PCT: # type: ignore
+                                raise RuntimeError(f"Slippage too large on taker fallback ({slip_pct*100:.2f}%)")
+
+                            params_taker = {
+                                "symbol": symbol,
+                                "side": ("BUY" if is_bull else "SELL"),
+                                "type": "MARKET",
+                                "quantity": qty_s,
+                                "newOrderRespType": "RESULT",
+                                "newClientOrderId": f"taker_entry_{now_ts_ms()}",
+                            }
+                            taker_resp = self._post("/fapi/v1/order", params_taker)
+                            logger.info(f"[ENTRY] TAKER {symbol} {side_u} qty={qty_s} FILLED (Fallback).")
+                            avg_filled_price = float(taker_resp.get("avgPrice", current_price))
+
+                    except Exception as e:
+                        # 捕捉下單錯誤 (例如 Post-Only 失敗會立刻拒絕)
+                        logger.warning(f"[ENTRY] MAKER attempt failed: {e}. Switching to TAKER.")
+                        # 直接嘗試 Taker (市價)
                         params_taker = {
                             "symbol": symbol,
                             "side": ("BUY" if is_bull else "SELL"),
@@ -590,66 +606,50 @@ class LiveAdapter:
                             "newClientOrderId": f"taker_entry_{now_ts_ms()}",
                         }
                         taker_resp = self._post("/fapi/v1/order", params_taker)
-                        logger.info(f"[ENTRY] TAKER {symbol} {side_u} qty={qty_s} FILLED (Fallback).")
-                        avg_filled_price = float(taker_resp.get("avgPrice", current_price))
+                        logger.info(f"[ENTRY] TAKER {symbol} {side_u} qty={qty_s} FILLED (Direct).")
+                        avg_filled_price = float(taker_resp.get("avgPrice", self.best_price(symbol)))
 
-                except Exception as e:
-                    # 捕捉下單錯誤 (例如 Post-Only 失敗會立刻拒絕)
-                    logger.warning(f"[ENTRY] MAKER attempt failed: {e}. Switching to TAKER.")
-                    # 直接嘗試 Taker (市價)
-                    params_taker = {
-                        "symbol": symbol,
-                        "side": ("BUY" if is_bull else "SELL"),
-                        "type": "MARKET",
-                        "quantity": qty_s,
-                        "newOrderRespType": "RESULT",
-                        "newClientOrderId": f"taker_entry_{now_ts_ms()}",
+
+                    # === 步驟 4: 掛載 TP/SL (沿用你已修復的邏輯) ===
+                    # 使用 avg_filled_price 重新計算 TP/SL (更精準)
+                    sl_f_new, tp_f_new = compute_bracket(avg_filled_price, side_u) # type: ignore
+
+                    info = EXCHANGE_INFO[symbol]
+                    price_prec = int(info.get("pricePrecision", 8))
+                    sl_s_fmt = f"{sl_f_new:.{price_prec}f}"
+                    tp_s_fmt = f"{tp_f_new:.{price_prec}f}"
+
+                    # ⬇️ *** 立刻設定 self.open (你已修復的關鍵邏輯) ***
+                    self.open = {
+                        "symbol": symbol, "side": side_u, "qty": float(qty_s),
+                        "entry": avg_filled_price, # <-- 使用真實成交均價
+                        "sl": float(sl_s_fmt), "tp": float(tp_s_fmt)
                     }
-                    taker_resp = self._post("/fapi/v1/order", params_taker)
-                    logger.info(f"[ENTRY] TAKER {symbol} {side_u} qty={qty_s} FILLED (Direct).")
-                    avg_filled_price = float(taker_resp.get("avgPrice", self.best_price(symbol)))
+                    logger.info(f"[STATE SET] {symbol} position locked internally @ {avg_filled_price:.{price_prec}f}")
 
+                    # ⬇️ *** 用 try/except 包住 TP/SL (你已修復的關鍵邏輯) ***
+                    try:
+                        params_sl = {
+                            "symbol": symbol, "side": ("SELL" if is_bull else "BUY"),
+                            "type": "STOP_MARKET", "stopPrice": sl_s_fmt,
+                            "closePosition": "true", "workingType": "MARK_PRICE",
+                            "newClientOrderId": f"sl_{now_ts_ms()}",
+                        }
+                        params_tp = {
+                            "symbol": symbol, "side": ("SELL" if is_bull else "BUY"),
+                            "type": "TAKE_PROFIT_MARKET", "stopPrice": tp_s_fmt,
+                            "closePosition": "true",
+                            "workingType": "MARK_PRICE", # <--- ！！！修正點！！！
+                            "newClientOrderId": f"tp_{now_ts_ms()}",
+                        }
+                        self._post("/fapi/v1/order", params_sl) # 送出 SL
+                        self._post("/fapi/v1/order", params_tp) # 送出 TP
+                        logger.info(f"[BRACKETS] {symbol} SL={sl_s_fmt} TP={tp_s_fmt} attached.")
+                    
+                    except Exception as e:
+                        logger.error(f"[CRITICAL] FAILED TO ATTACH TP/SL for {symbol}: {e}")
+                    
+                    return "OK"
 
-                # === 步驟 4: 掛載 TP/SL (沿用你已修復的邏輯) ===
-                # 使用 avg_filled_price 重新計算 TP/SL (更精準)
-                # (如果 Taker 單沒有回傳 avgPrice，我們在上面已經用 best_price() 抓了)
-                sl_f_new, tp_f_new = compute_bracket(avg_filled_price, side_u) # type: ignore
-
-                info = EXCHANGE_INFO[symbol]
-                price_prec = int(info.get("pricePrecision", 8))
-                sl_s_fmt = f"{sl_f_new:.{price_prec}f}"
-                tp_s_fmt = f"{tp_f_new:.{price_prec}f}"
-
-                # ⬇️ *** 立刻設定 self.open (你已修復的關鍵邏輯) ***
-                self.open = {
-                    "symbol": symbol, "side": side_u, "qty": float(qty_s),
-                    "entry": avg_filled_price, # <-- 使用真實成交均價
-                    "sl": float(sl_s_fmt), "tp": float(tp_s_fmt)
-                }
-                logger.info(f"[STATE SET] {symbol} position locked internally @ {avg_filled_price:.{price_prec}f}")
-
-                # ⬇️ *** 用 try/except 包住 TP/SL (你已修復的關鍵邏輯) ***
-                try:
-                    params_sl = {
-                        "symbol": symbol, "side": ("SELL" if is_bull else "BUY"),
-                        "type": "STOP_MARKET", "stopPrice": sl_s_fmt,
-                        "closePosition": "true", "workingType": "MARK_PRICE",
-                        "newClientOrderId": f"sl_{now_ts_ms()}",
-                    }
-                    params_tp = {
-                        "symbol": symbol, "side": ("SELL" if is_bull else "BUY"),
-                        "type": "TAKE_PROFIT_MARKET", "stopPrice": tp_s_fmt,
-                        "closePosition": "true", "workingType": "MARKMARKET",
-                        "newClientOrderId": f"tp_{now_ts_ms()}",
-                    }
-                    self._post("/fapi/v1/order", params_sl)
-                    self._post("/fapi/v1/order", params_tp)
-                    logger.info(f"[BRACKETS] {symbol} SL={sl_s_fmt} TP={tp_s_fmt} attached.")
-                
-                except Exception as e:
-                    logger.error(f"[CRITICAL] FAILED TO ATTACH TP/SL for {symbol}: {e}")
-                
-                return "OK"
-
-            finally:
-                self._placing = False
+                finally:
+                    self._placing = False
